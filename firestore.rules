@@ -1,0 +1,18 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Explicitly allow read and write access to the app_state document and its knowledge_base subcollection
+    match /app_state/{docId} {
+      allow read, write: if true;
+
+      match /knowledge_base/{kbDocId} {
+        allow read, write: if true;
+      }
+
+      match /history/{historyId} {
+        allow read, write: if true;
+      }
+    }
+  }
+}
+

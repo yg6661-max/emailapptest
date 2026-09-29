@@ -1,0 +1,6 @@
+{
+  "name": "Email Calendar Scheduler",
+  "description": "Receive email content from Zapier, summarize it or extract events using Gemini, and schedule them on Google Calendar.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

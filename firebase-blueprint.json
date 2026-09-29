@@ -1,0 +1,34 @@
+{
+  "entities": {
+    "AppState": {
+      "title": "Application State",
+      "description": "Stores user credentials, calendars settings, and email processing history.",
+      "type": "object",
+      "properties": {
+        "credentials": {
+          "type": "object",
+          "description": "Google OAuth client details and current access/refresh tokens"
+        },
+        "settings": {
+          "type": "object",
+          "description": "User specific scheduler configurations"
+        },
+        "history": {
+          "type": "array",
+          "description": "The processing log array and AI summary records of processed emails"
+        }
+      },
+      "required": [
+        "credentials",
+        "settings",
+        "history"
+      ]
+    }
+  },
+  "firestore": {
+    "/app_state/main": {
+      "schema": "AppState",
+      "description": "The single document holding global application state for high durability across serverless scale-down cycles"
+    }
+  }
+}

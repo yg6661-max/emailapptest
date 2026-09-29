@@ -1,0 +1,8 @@
+{
+  "firestore": [
+    {
+      "database": "ai-studio-emailcalendarsch-a7c22c58-dd8b-4d29-ba80-720d5cc62455",
+      "rules": "firestore.rules"
+    }
+  ]
+}
