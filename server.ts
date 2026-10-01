@@ -7,6 +7,7 @@ import dotenv from "dotenv";
 import { initializeApp } from "firebase/app";
 import { getFirestore, doc, getDoc, setDoc, setLogLevel, collection, getDocs, deleteDoc } from "firebase/firestore";
 import * as cheerio from "cheerio";
+import zlib from "node:zlib";
 import {
   crawlSite,
   cleanHtmlContent,
@@ -66,6 +67,29 @@ const app = express();
 const PORT = 3000;
 
 app.use(express.json({ limit: "50mb" }));
+
+// JSON 응답 gzip (8KB 초과) — 지식베이스/이력 응답이 1MB 를 넘는 경우가 많아 전송량을 1/7 수준으로 줄인다
+app.use((req, res, next) => {
+  const originalJson = res.json.bind(res);
+  (res as any).json = (body: any) => {
+    try {
+      const str = JSON.stringify(body);
+      const accept = String(req.headers["accept-encoding"] || "");
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      if (accept.includes("gzip") && str.length > 8192) {
+        const gz = zlib.gzipSync(Buffer.from(str, "utf8"), { level: 6 });
+        res.setHeader("Content-Encoding", "gzip");
+        res.setHeader("Vary", "Accept-Encoding");
+        res.setHeader("Content-Length", String(gz.length));
+        return res.end(gz);
+      }
+      return res.send(str);
+    } catch {
+      return originalJson(body);
+    }
+  };
+  next();
+});
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 // In-Memory Database Cache (Pre-loaded from Cloud Firestore at server boot)
@@ -604,6 +628,24 @@ function runWorkflowInBackground(subject: string, body: string, dateReceived: st
   });
 }
 
+let localBackupTimer: NodeJS.Timeout | null = null;
+function scheduleLocalBackup() {
+  if (localBackupTimer) return;
+  localBackupTimer = setTimeout(() => {
+    localBackupTimer = null;
+    const snapshot = cachedDb;
+    if (!snapshot) return;
+    let json = "";
+    try { json = JSON.stringify(snapshot); } catch (e) { console.error("[Local Backup] serialize failed:", e); return; }
+    fs.writeFile(DB_PATH + ".tmp", json, "utf8", (err) => {
+      if (err) { console.error("[Local Backup] Failed to write local DB backup:", err); return; }
+      fs.rename(DB_PATH + ".tmp", DB_PATH, (renameErr) => {
+        if (renameErr) console.error("[Local Backup] Failed to finalize local DB backup:", renameErr);
+      });
+    });
+  }, 500);
+}
+
 // Read database (Return pre-loaded memory cache synchronously for high performance)
 function readDb() {
   if (!cachedDb) {
@@ -625,12 +667,8 @@ async function writeDb(data: any) {
   // Update warm memory cache immediately to guarantee instant single-session consistency
   cachedDb = data;
 
-  // Synchronously serialize to disk backup (Double write protection)
-  try {
-    fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), "utf8");
-  } catch (error) {
-    console.error("[Local Backup] Failed to write local DB backup:", error);
-  }
+  // 로컬 백업: 호출마다 1MB+ 동기 쓰기 대신 500ms 디바운스 + 비동기 + compact JSON
+  scheduleLocalBackup();
 
   // Firestore 동기화는 백그라운드 큐에서 수행 — 요청 응답을 막지 않는다 (요청 중 CPU 가 있는 동안 진행되며, 폴링/후속 요청이 이어 받음)
   scheduleFirestoreSync();
@@ -2278,17 +2316,51 @@ app.post("/api/history/delete", async (req, res) => {
 });
 
 // Retrieve custom knowledge base documents (RAG)
+let lastAutoRecoverySyncAt = 0;
+const KB_PREVIEW_CHARS = 400;
+function toLightDoc(doc: any) {
+  const content: string = doc.content || "";
+  return {
+    ...doc,
+    content: content.length > KB_PREVIEW_CHARS ? content.substring(0, KB_PREVIEW_CHARS) + "…" : content,
+    contentLength: content.length,
+    light: true,
+  };
+}
+
 app.get("/api/knowledge-base", async (req, res) => {
-  if (lastFirestoreError && firestoreDb && !isFirestorePaused()) {
-    // Attempt automatic background recovery sync if an error was recorded
+  // 자동 복구 동기화(클라우드 전체 읽기)는 5분에 1회만 — 화면 갱신마다 Firestore 전체 읽기를 유발하지 않도록
+  if (lastFirestoreError && firestoreDb && !isFirestorePaused() && Date.now() - lastAutoRecoverySyncAt > 5 * 60 * 1000) {
+    lastAutoRecoverySyncAt = Date.now();
     await syncFromFirestore();
   }
   const db = readDb();
-  res.json({ 
-    knowledgeBase: db.knowledgeBase || [],
+  const light = String(req.query.light || "") === "1";
+  const q = String(req.query.q || "").trim().toLowerCase();
+  let docs: any[] = db.knowledgeBase || [];
+  if (q.length >= 2) {
+    docs = docs.filter((d: any) =>
+      (d.title || "").toLowerCase().includes(q) ||
+      (d.content || "").toLowerCase().includes(q) ||
+      (d.tags || []).some((t: any) => String(t).toLowerCase().includes(q)) ||
+      (d.category || "").toLowerCase().includes(q)
+    );
+  }
+  res.json({
+    knowledgeBase: light ? docs.map(toLightDoc) : docs,
     sourceUrls: db.sourceUrls || [],
-    firestoreError: lastFirestoreError
+    firestoreError: lastFirestoreError,
+    total: (db.knowledgeBase || []).length,
+    light,
   });
+});
+
+// 단건 전체 본문 (편집/상세 보기용)
+app.get("/api/knowledge-base/doc/:id", (req, res) => {
+  const db = readDb();
+  const found = (db.knowledgeBase || []).find((d: any) => d.id === req.params.id);
+  if (!found) return res.status(404).json({ error: "Document not found." });
+  res.json({ doc: found });
 });
 
 // Explicit retry sync endpoint for RAG Workspace
@@ -3083,7 +3155,14 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
+    app.use(express.static(distPath, {
+      maxAge: "1y",
+      immutable: true,
+      index: false,
+      setHeaders: (res, filePath) => {
+        if (filePath.endsWith(".html")) res.setHeader("Cache-Control", "no-cache");
+      },
+    }));
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });

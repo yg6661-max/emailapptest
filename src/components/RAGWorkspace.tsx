@@ -34,6 +34,7 @@ export default function RAGWorkspace({ onRefreshHistory }: RAGWorkspaceProps) {
 
   // Search & Filter state for Knowledge documents
   const [searchQuery, setSearchQuery] = useState("");
+  const lastCrawlRefreshRef = useRef(0);
   const [viewFilter, setViewFilter] = useState<"all" | "uploaded" | "default">("all");
 
   // QA Playground fields
@@ -79,7 +80,9 @@ export default function RAGWorkspace({ onRefreshHistory }: RAGWorkspaceProps) {
   const fetchKnowledgeBase = async () => {
     setLoadingDocs(true);
     try {
-      const res = await fetch("/api/knowledge-base");
+      // light 모드: 본문 미리보기만 받아 전송량을 줄이고, 검색어(2자 이상)는 서버에서 전체 본문 대상으로 검색
+      const qs = searchQuery && searchQuery.trim().length >= 2 ? `&q=${encodeURIComponent(searchQuery.trim())}` : "";
+      const res = await fetch(`/api/knowledge-base?light=1${qs}`);
       const contentType = res.headers.get("content-type") || "";
       if (res.ok && contentType.includes("application/json")) {
         const data = await res.json();
@@ -187,12 +190,22 @@ export default function RAGWorkspace({ onRefreshHistory }: RAGWorkspaceProps) {
   };
 
   // Load template data to form for modifying
-  const handleEditKb = (doc: any) => {
-    setKbEditingId(doc.id);
-    setKbTitle(doc.title);
-    setKbCategory(doc.category || "Cumulus Linux");
-    setKbTags((doc.tags || []).join(", "));
-    setKbContent(doc.content);
+  const handleEditKb = async (doc: any) => {
+    let full = doc;
+    if (doc.light) {
+      // light 목록에는 미리보기만 있으므로 편집 전 전체 본문을 가져온다
+      try {
+        const r = await fetch(`/api/knowledge-base/doc/${encodeURIComponent(doc.id)}`);
+        if (r.ok) { const d = await r.json(); if (d && d.doc) full = d.doc; }
+      } catch (e) {
+        console.error("Failed to load full document:", e);
+      }
+    }
+    setKbEditingId(full.id);
+    setKbTitle(full.title);
+    setKbCategory(full.category || "Cumulus Linux");
+    setKbTags((full.tags || []).join(", "));
+    setKbContent(full.content);
     setShowKbForm(true);
   };
 
@@ -307,8 +320,15 @@ export default function RAGWorkspace({ onRefreshHistory }: RAGWorkspaceProps) {
             if (data.message) {
               setCrawlLogs((prev) => [...prev, data.message]);
             }
-            if (data.type === "start" || data.type === "saved" || data.type === "complete") {
+            if (data.type === "start" || data.type === "complete") {
               fetchKnowledgeBase();
+            } else if (data.type === "saved") {
+              // 페이지 저장마다 전체 목록을 다시 받지 않도록 15초 스로틀
+              const now = Date.now();
+              if (now - lastCrawlRefreshRef.current > 15000) {
+                lastCrawlRefreshRef.current = now;
+                fetchKnowledgeBase();
+              }
             }
           } catch (err) {
             console.warn("Failed to parse crawler line chunk:", trimmed, err);
@@ -356,6 +376,13 @@ export default function RAGWorkspace({ onRefreshHistory }: RAGWorkspaceProps) {
     ).length;
   }, [knowledgeBase]);
   const defaultCount = useMemo(() => allCount - uploadedCount, [allCount, uploadedCount]);
+
+  // 검색어 변경 시 서버 검색 (350ms 디바운스)
+  useEffect(() => {
+    const t = setTimeout(() => { fetchKnowledgeBase(); }, 350);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQuery]);
 
   // Filtered list optimized with useMemo
   const filteredDocs = useMemo(() => {
@@ -751,7 +778,7 @@ export default function RAGWorkspace({ onRefreshHistory }: RAGWorkspaceProps) {
                                 <div className="flex items-center justify-between text-[9px] text-slate-400 mt-2 pt-1.5 border-t border-slate-105 border-dashed">
                                   <span className="truncate max-w-[170px]" title={doc.sourceUrl}>{doc.sourceUrl || item.url}</span>
                                   <span className="font-mono bg-slate-50 text-slate-500 px-1 py-0.3 rounded">
-                                    {(doc.content ? doc.content.length : 0).toLocaleString()}자
+                                    {(doc.contentLength ?? (doc.content ? doc.content.length : 0)).toLocaleString()}자
                                   </span>
                                 </div>
                               </div>
@@ -1167,6 +1194,9 @@ export default function RAGWorkspace({ onRefreshHistory }: RAGWorkspaceProps) {
 
                     <div className="text-[10.5px] text-slate-600 leading-relaxed font-mono whitespace-pre-wrap bg-white p-3 border border-slate-100 rounded-lg overflow-y-auto max-h-36 scrollbar-thin">
                       {doc.content}
+                      {doc.light && doc.contentLength > (doc.content || "").length ? (
+                        <span className="block mt-1 text-slate-400">…(미리보기 — 전체 {Number(doc.contentLength).toLocaleString()}자, '수정' 으로 전체 열람)</span>
+                      ) : null}
                     </div>
 
                     {doc.tags && doc.tags.length > 0 && (

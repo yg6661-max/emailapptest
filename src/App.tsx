@@ -157,7 +157,7 @@ export default function App() {
   const fetchKnowledgeBase = async () => {
     setLoadingKnowledge(true);
     try {
-      const res = await fetch("/api/knowledge-base");
+      const res = await fetch("/api/knowledge-base?light=1");
       const data = await safeFetchJson(res);
       if (data) {
         setKnowledgeBase(data.knowledgeBase || []);
@@ -228,12 +228,21 @@ export default function App() {
   };
 
   // Load template data to form
-  const handleEditKb = (doc: any) => {
-    setKbEditingId(doc.id);
-    setKbTitle(doc.title);
-    setKbCategory(doc.category);
-    setKbTags((doc.tags || []).join(", "));
-    setKbContent(doc.content);
+  const handleEditKb = async (doc: any) => {
+    let full = doc;
+    if (doc.light) {
+      try {
+        const r = await fetch(`/api/knowledge-base/doc/${encodeURIComponent(doc.id)}`);
+        if (r.ok) { const d = await r.json(); if (d && d.doc) full = d.doc; }
+      } catch (e) {
+        console.error("Failed to load full document:", e);
+      }
+    }
+    setKbEditingId(full.id);
+    setKbTitle(full.title);
+    setKbCategory(full.category);
+    setKbTags((full.tags || []).join(", "));
+    setKbContent(full.content);
     setShowKbForm(true);
   };
 
