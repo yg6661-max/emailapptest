@@ -611,7 +611,6 @@ export default function App() {
       if (res.ok && data.success) {
         // Success alert
         alert("성공적으로 구글 캘린더에 일정을 등록했습니다!");
-        fetchHistory();
         fetchStatus();
       } else {
         alert(`재전송 실패: ${data.error || "일시적인 오류가 발생했거나 연동이 중단되었습니다."}`);
@@ -620,6 +619,7 @@ export default function App() {
       console.error("Retry failed:", err);
       alert(`재전송 요청 실패: ${err.message || err}`);
     } finally {
+      fetchHistory();
       setRetryingIds(prev => ({ ...prev, [id]: false }));
     }
   };

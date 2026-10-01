@@ -7,6 +7,14 @@ import dotenv from "dotenv";
 import { initializeApp } from "firebase/app";
 import { getFirestore, doc, getDoc, setDoc, setLogLevel, collection, getDocs, deleteDoc } from "firebase/firestore";
 import * as cheerio from "cheerio";
+import {
+  crawlSite,
+  cleanHtmlContent,
+  docBelongsToSource,
+  normalizeUrlKey,
+  CRAWL_MAX_PAGES_CAP,
+  CRAWL_MAX_DEPTH_CAP,
+} from "./server_crawler.ts";
 
 dotenv.config();
 
@@ -167,7 +175,11 @@ async function syncFromFirestore(): Promise<boolean> {
       try {
         const kbQuerySnap = await getDocs(kbCollectionRef);
         kbQuerySnap.forEach((d) => {
-          if (d.exists()) cloudKbDocs.push(d.data());
+          if (d.exists()) {
+            const data = d.data();
+            cloudKbDocs.push(data);
+            if (data && data.id) kbSyncSig.set(data.id, kbSigOf(data));
+          }
         });
       } catch (kbErr) {
         console.warn("[Firebase] Error fetching knowledge_base subcollection items:", kbErr);
@@ -179,7 +191,11 @@ async function syncFromFirestore(): Promise<boolean> {
       try {
         const historyQuerySnap = await getDocs(historyCollectionRef);
         historyQuerySnap.forEach((d) => {
-          if (d.exists()) cloudHistoryDocs.push(d.data());
+          if (d.exists()) {
+            const data = d.data();
+            cloudHistoryDocs.push(data);
+            if (data && data.id) histSyncSig.set(data.id, histSigOf(data));
+          }
         });
       } catch (histErr) {
         console.warn("[Firebase] Error fetching history subcollection items:", histErr);
@@ -361,13 +377,26 @@ async function initDbAndSyncFirestore() {
 
       // 3. Sync from warm persistent cloud
       const synced = await syncFromFirestore();
+      bootSyncOk = synced;
       if (!synced) {
-        // Retrying once after 1 second if transient socket connection failed on immediate boot
-        setTimeout(() => {
-          syncFromFirestore().then((res) => {
-            if (res) console.log("[Firebase] Delayed boot sync succeeded!");
-          });
-        }, 1500);
+        // 일시적 연결 실패 대비: 최대 8회 지수 백오프 재시도 (2s, 4s, 8s, ... 최대 60s)
+        (async () => {
+          for (let attempt = 1; attempt <= 8 && !bootSyncOk; attempt++) {
+            const waitMs = Math.min(60000, 2000 * Math.pow(2, attempt - 1));
+            await new Promise((r) => setTimeout(r, waitMs));
+            try {
+              if (await syncFromFirestore()) {
+                bootSyncOk = true;
+                console.log(`[Firebase] Delayed boot sync succeeded on retry #${attempt}.`);
+              } else {
+                console.warn(`[Firebase] Boot sync retry #${attempt} failed.`);
+              }
+            } catch (e: any) {
+              console.warn(`[Firebase] Boot sync retry #${attempt} error:`, e?.message || e);
+            }
+          }
+          if (!bootSyncOk) console.error("[Firebase] Boot sync failed after retries — credentials writes stay protected until a manual sync succeeds.");
+        })();
       }
     } else {
       console.warn("[Firebase] firebase-applet-config.json not found. Operating strictly on ephemeral local files.");
@@ -377,6 +406,67 @@ async function initDbAndSyncFirestore() {
     if (!cachedDb) {
       lastFirestoreError = error?.message || String(error);
     }
+  }
+}
+
+// 명시적 로그아웃/초기화일 때만 true — 그 외에는 빈 토큰으로 Firestore 자격증명을 덮어쓰지 않는다
+let allowCredentialWipe = false;
+// 부팅 후 Firestore 동기화 성공 여부
+let bootSyncOk = false;
+
+// Firestore 증분 동기화용 시그니처 (id → 마지막으로 성공 저장한 문서의 서명)
+const kbSyncSig = new Map<string, string>();
+const histSyncSig = new Map<string, string>();
+const kbSigOf = (d: any) => `${d.updatedAt || ""}|${(d.content || "").length}|${d.title || ""}|${(d.tags || []).length}`;
+const histSigOf = (h: any) => `${h.status || ""}|${h.errorMessage || ""}|${h.calendarEventId || ""}|${h.timestamp || ""}|${h.aiSummary ? 1 : 0}`;
+
+/**
+ * 소스(crawlRoot) 의 크롤 문서를 새 결과로 교체한다 (swap).
+ * - 새 결과가 0건이면 기존 문서를 유지하고 false 를 반환 (중간 실패로 지식베이스가 비는 것 방지)
+ * - 교체 시 Firestore 에서도 사라진 문서를 삭제
+ */
+async function replaceCrawledDocsForSource(sourceUrl: string, newDocs: any[], log?: (m: string) => void): Promise<{ replaced: boolean; removed: number; added: number }> {
+  const db = readDb();
+  if (!db.knowledgeBase) db.knowledgeBase = [];
+  if (!newDocs || newDocs.length === 0) {
+    log?.(`⚠️ 새로 수집된 문서가 없어 기존 문서를 유지합니다: ${sourceUrl}`);
+    return { replaced: false, removed: 0, added: 0 };
+  }
+  const oldDocs = db.knowledgeBase.filter((d: any) => docBelongsToSource(d, sourceUrl));
+  const newIds = new Set(newDocs.map((d: any) => d.id));
+  const toDelete = oldDocs.filter((d: any) => !newIds.has(d.id));
+  db.knowledgeBase = db.knowledgeBase.filter((d: any) => !docBelongsToSource(d, sourceUrl));
+  db.knowledgeBase.unshift(...newDocs);
+  await writeDb(db);
+  if (firestoreDb && toDelete.length > 0) {
+    for (const d of toDelete) {
+      try {
+        await deleteDoc(doc(firestoreDb, "app_state", "main", "knowledge_base", d.id));
+      } catch (e) {
+        // ignore
+      }
+      kbSyncSig.delete(d.id);
+    }
+  }
+  log?.(`🔄 소스 문서 교체 완료: 기존 ${oldDocs.length}건 → 신규 ${newDocs.length}건 (삭제 ${toDelete.length})`);
+  return { replaced: true, removed: toDelete.length, added: newDocs.length };
+}
+
+/** 소스 URL 설정(sourceUrls) 갱신 */
+function upsertSourceConfig(db: any, sourceHref: string, patch: Record<string, any>) {
+  if (!db.sourceUrls) db.sourceUrls = [];
+  const key = normalizeUrlKey(sourceHref);
+  const idx = db.sourceUrls.findIndex((item: any) => normalizeUrlKey(item.url) === key);
+  if (idx !== -1) {
+    db.sourceUrls[idx] = { ...db.sourceUrls[idx], ...patch };
+  } else {
+    db.sourceUrls.unshift({
+      id: `src_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      url: sourceHref,
+      createdAt: new Date().toISOString(),
+      count: 0,
+      ...patch,
+    });
   }
 }
 
@@ -414,34 +504,66 @@ async function writeDb(data: any) {
     try {
       // Save settings, credentials, and logs to the main document, omitting the large knowledgeBase and history arrays
       const { knowledgeBase, history, ...mainDataWithoutKbAndHistory } = data;
-      await setDoc(docRef, mainDataWithoutKbAndHistory);
+      const mainPayload: any = { ...mainDataWithoutKbAndHistory };
+      const outCreds = mainPayload.credentials;
+      const credsEmpty = !outCreds || (!outCreds.accessToken && !outCreds.refreshToken);
+      if (credsEmpty && !allowCredentialWipe) {
+        // 부팅 동기화 실패 등으로 메모리 상태가 비어 있을 때 클라우드의 유효 토큰을 지우지 않는다.
+        // clientId/clientSecret 같은 비토큰 필드만 merge 로 반영하고 토큰 필드는 건드리지 않는다.
+        const keep: any = {};
+        if (outCreds?.clientId) keep.clientId = outCreds.clientId;
+        if (outCreds?.clientSecret) keep.clientSecret = outCreds.clientSecret;
+        if (Object.keys(keep).length > 0) mainPayload.credentials = keep; else delete mainPayload.credentials;
+        if (!bootSyncOk) {
+          console.warn("[Firebase] Boot sync not confirmed — writing without credentials to protect stored tokens.");
+        }
+      }
+      allowCredentialWipe = false;
+      await setDoc(docRef, mainPayload, { merge: true });
       console.log("[Firebase] Successfully persisted main state to Firestore.");
 
-      // Individually save each knowledge document to the subcollection to prevent the 1MB limit crash
+      // 증분 동기화: 변경된 문서만 Firestore 에 기록. 실패한 문서는 서명을 남기지 않아 다음 writeDb 에서 재시도된다.
+      let failed = 0;
+      let written = 0;
       if (Array.isArray(knowledgeBase)) {
         for (const kbDoc of knowledgeBase) {
-          if (kbDoc && kbDoc.id) {
-            const kbDocRef = doc(firestoreDb, "app_state", "main", "knowledge_base", kbDoc.id);
-            await setDoc(kbDocRef, kbDoc);
+          if (!kbDoc || !kbDoc.id) continue;
+          const sig = kbSigOf(kbDoc);
+          if (kbSyncSig.get(kbDoc.id) === sig) continue;
+          try {
+            await setDoc(doc(firestoreDb, "app_state", "main", "knowledge_base", kbDoc.id), kbDoc);
+            kbSyncSig.set(kbDoc.id, sig);
+            written++;
+          } catch (e: any) {
+            failed++;
+            lastFirestoreError = e?.message || String(e);
           }
         }
       }
-
-      // Individually save each history document to the subcollection to prevent the 1MB limit crash
       if (Array.isArray(history)) {
         for (const histDoc of history) {
-          if (histDoc && histDoc.id) {
-            const histDocRef = doc(firestoreDb, "app_state", "main", "history", histDoc.id);
-            await setDoc(histDocRef, histDoc);
+          if (!histDoc || !histDoc.id) continue;
+          const sig = histSigOf(histDoc);
+          if (histSyncSig.get(histDoc.id) === sig) continue;
+          try {
+            await setDoc(doc(firestoreDb, "app_state", "main", "history", histDoc.id), histDoc);
+            histSyncSig.set(histDoc.id, sig);
+            written++;
+          } catch (e: any) {
+            failed++;
+            lastFirestoreError = e?.message || String(e);
           }
         }
       }
-      lastFirestoreError = null; // Clear on success
+      if (failed === 0) {
+        lastFirestoreError = null;
+        if (written > 0) console.log(`[Firebase] Incremental sync: ${written} document(s) written.`);
+      } else {
+        console.warn(`[Firebase] Incremental sync: ${written} written, ${failed} FAILED — will retry on next write. Last error: ${lastFirestoreError}`);
+      }
     } catch (err: any) {
       console.warn("[Firebase] Operating in local database write mode:", err?.message || err);
-      if (!cachedDb) {
-        lastFirestoreError = err?.message || String(err);
-      }
+      lastFirestoreError = err?.message || String(err);
     }
   }
 }
@@ -511,18 +633,27 @@ async function getValidAccessToken(): Promise<string | null> {
             creds.refreshToken = tokens.refresh_token;
           }
           db.credentials = creds;
-          writeDb(db);
+          await writeDb(db);
           console.log("Token refreshed successfully.");
           return tokens.access_token;
         } else {
-          console.log("[OAuth] Clean connection up: Google OAuth refresh token was expired or revoked, session has been cleared.");
-          // If refresh token is invalid or revoked, force disconnect fully
-          creds.accessToken = "";
-          creds.refreshToken = "";
-          creds.tokenExpiry = 0;
-          db.credentials = creds;
-          writeDb(db);
-          return null;
+          const errCode = String(tokens?.error || "");
+          const errDesc = String(tokens?.error_description || "");
+          const isRevoked = response.status === 400 && errCode === "invalid_grant";
+          if (isRevoked) {
+            // refresh token 자체가 만료/폐기됨 (사용자 취소, 비밀번호 변경, 테스트 모드 7일 만료, 클라이언트 변경 등)
+            console.error(`[OAuth] Refresh token rejected by Google (invalid_grant: ${errDesc}). Clearing session — re-authentication required.`);
+            creds.accessToken = "";
+            creds.refreshToken = "";
+            creds.tokenExpiry = 0;
+            db.credentials = creds;
+            allowCredentialWipe = true;
+            await writeDb(db);
+            return null;
+          }
+          // 5xx / 429 / 기타 일시 오류: 토큰을 지우지 않고 다음 주기에 재시도
+          console.warn(`[OAuth] Token refresh failed transiently (HTTP ${response.status} ${errCode} ${errDesc}). Keeping stored tokens.`);
+          return now < creds.tokenExpiry ? creds.accessToken : null;
         }
       } catch (error) {
         console.warn("Network warning during Google token refresh:", error);
@@ -535,7 +666,8 @@ async function getValidAccessToken(): Promise<string | null> {
         creds.accessToken = "";
         creds.tokenExpiry = 0;
         db.credentials = creds;
-        writeDb(db);
+        allowCredentialWipe = true;
+        await writeDb(db);
         return null;
       }
     }
@@ -570,7 +702,8 @@ function startBackgroundTokenRefresher() {
             creds.accessToken = "";
             creds.tokenExpiry = 0;
             db.credentials = creds;
-            writeDb(db);
+            allowCredentialWipe = true;
+            await writeDb(db);
           }
         }
       }
@@ -615,278 +748,49 @@ async function checkAndRunAutoRecrawl() {
   console.log(`[Auto-Recrawl] Inspecting ${db.sourceUrls.length} registered RAG source URLs...`);
 
   for (const source of db.sourceUrls) {
-    if (!source.url) continue;
+    if (!source || !source.url) continue;
 
-    // Check actual document count in knowledgeBase belonging to this source
-    const actualCount = (db.knowledgeBase || []).filter((doc: any) => {
-      if (!doc.id || !doc.id.startsWith("kb_crawl_")) return false;
-      if (doc.sourceUrl) {
-        return doc.sourceUrl.toLowerCase().replace(/\/+$/, "") === source.url.toLowerCase().replace(/\/+$/, "");
-      }
-      if (doc.content) {
-        const match = doc.content.match(/\[출처 URL: ([^\]]+)\]/);
-        if (match && match[1]) {
-          const cleanDocUrl = match[1].toLowerCase().trim().replace(/\/+$/, "");
-          const cleanStartUrl = source.url.toLowerCase().trim().replace(/\/+$/, "");
-          return cleanDocUrl.startsWith(cleanStartUrl) || cleanDocUrl === cleanStartUrl;
-        }
-      }
-      return false;
-    }).length;
-
+    const actualCount = (readDb().knowledgeBase || []).filter((d: any) => docBelongsToSource(d, source.url)).length;
     const now = Date.now();
     const lastCrawledTime = source.lastCrawledAt ? new Date(source.lastCrawledAt).getTime() : 0;
     const isStale = (now - lastCrawledTime) > 3 * 24 * 60 * 60 * 1000; // 3 days
     const isMissing = actualCount === 0;
 
-    if (isMissing || isStale) {
-      const reason = isMissing 
-        ? `수집된 지식 문서 없음 (데이터 복구 유도 - 실제 색인수: ${actualCount}개)` 
-        : `마지막 수집 후 3일 경과 (마지막 수집: ${source.lastCrawledAt})`;
-        
-      console.log(`[Auto-Recrawl] Triggering auto-recrawl for: ${source.url} (${reason})`);
-      
-      try {
-        // Delete older crawled files belonging to this specific source first to prevent accumulation/duplicates
-        if (actualCount > 0) {
-          const dbCurrent = readDb();
-          const itemsToDelete = (dbCurrent.knowledgeBase || []).filter((doc: any) => {
-            if (!doc.id || !doc.id.startsWith("kb_crawl_")) return false;
-            if (doc.sourceUrl) {
-              return doc.sourceUrl.toLowerCase().replace(/\/+$/, "") === source.url.toLowerCase().replace(/\/+$/, "");
-            }
-            if (doc.content) {
-              const match = doc.content.match(/\[출처 URL: ([^\]]+)\]/);
-              if (match && match[1]) {
-                const cleanDocUrl = match[1].toLowerCase().trim().replace(/\/+$/, "");
-                const cleanStartUrl = source.url.toLowerCase().trim().replace(/\/+$/, "");
-                return cleanDocUrl.startsWith(cleanStartUrl) || cleanDocUrl === cleanStartUrl;
-              }
-            }
-            return false;
-          });
+    if (!isMissing && !isStale) {
+      console.log(`[Auto-Recrawl] Source ${source.url} is up-to-date (docs: ${actualCount}, last: ${source.lastCrawledAt}).`);
+      continue;
+    }
 
-          if (itemsToDelete.length > 0) {
-            console.log(`[Auto-Recrawl] Cleaned ${itemsToDelete.length} stale/displaced documents before recrawling.`);
-            dbCurrent.knowledgeBase = dbCurrent.knowledgeBase.filter(
-              (doc: any) => !itemsToDelete.some((delItem: any) => delItem.id === doc.id)
-            );
-            
-            // Sync deletion to Firestore
-            if (firestoreDb) {
-              for (const delDoc of itemsToDelete) {
-                try {
-                  const docRef = doc(firestoreDb, "app_state", "main", "knowledge_base", delDoc.id);
-                  await deleteDoc(docRef);
-                } catch (fbErr) {
-                  // ignore
-                }
-              }
-            }
-            await writeDb(dbCurrent);
-          }
-        }
+    const reason = isMissing
+      ? `수집된 지식 문서 없음 (실제 색인수: ${actualCount})`
+      : `마지막 수집 후 3일 경과 (마지막 수집: ${source.lastCrawledAt})`;
+    console.log(`[Auto-Recrawl] Triggering auto-recrawl for: ${source.url} (${reason})`);
 
-        // Silent programmatical crawl
-        console.log(`[Auto-Recrawl] Silent crawler launched on: ${source.url}`);
-        
-        let resolvedUrl = source.url.trim();
-        if (!/^https?:\/\//i.test(resolvedUrl)) {
-          resolvedUrl = "https://" + resolvedUrl;
-        }
+    try {
+      const result = await crawlSite({
+        startUrl: source.url,
+        maxPages: Math.min(Math.max(source.maxPages || 10, 1), CRAWL_MAX_PAGES_CAP),
+        maxDepth: Math.min(Math.max(source.maxDepth || 2, 1), CRAWL_MAX_DEPTH_CAP),
+        category: source.category || "Crawled Web",
+        log: (m, type) => { if (type !== "progress") console.log(`[Auto-Recrawl] ${m}`); },
+      });
 
-        const startUrlObj = new URL(resolvedUrl);
-        const allowedHostname = startUrlObj.hostname;
-
-        const pagesToCrawl = Math.min(Math.max(source.maxPages || 10, 1), 50);
-        const depthToCrawl = Math.min(Math.max(source.maxDepth || 2, 1), 4);
-        const docCategory = source.category || "Crawled Web";
-
-        const queue: { url: string; depth: number }[] = [{ url: startUrlObj.href, depth: 1 }];
-        const crawledUrls = new Set<string>();
-        let successCount = 0;
-
-        const fetchWithTimeout = async (targetUrl: string, timeoutMs = 6000) => {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), timeoutMs);
-          try {
-            const response = await fetch(targetUrl, {
-              signal: controller.signal,
-              headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Cache-Control": "no-cache"
-              }
-            });
-            clearTimeout(timer);
-            return response;
-          } catch (err) {
-            clearTimeout(timer);
-            throw err;
-          }
-        };
-
-        while (queue.length > 0 && crawledUrls.size < pagesToCrawl) {
-          const current = queue.shift();
-          if (!current) continue;
-
-          if (crawledUrls.has(current.url)) {
-            continue;
-          }
-
-          crawledUrls.add(current.url);
-
-          try {
-            // Politeness delay
-            await new Promise((resolve) => setTimeout(resolve, 300));
-
-            const response = await fetchWithTimeout(current.url);
-            if (!response.ok) continue;
-
-            const contentType = response.headers.get("content-type") || "";
-            if (!contentType.toLowerCase().includes("text/html")) continue;
-
-            const html = await response.text();
-            const { title: cleanTitle, content: bodyText, childHrefs } = cleanHtmlContent(html, current.url);
-
-            // Extract child URLs first before depth limit
-            if (current.depth < depthToCrawl) {
-              childHrefs.forEach((href) => {
-                try {
-                  const resolved = new URL(href, current.url);
-                  if (resolved.hostname === allowedHostname && (resolved.protocol === "http:" || resolved.protocol === "https:")) {
-                    resolved.hash = "";
-                    const cleanHref = resolved.href;
-
-                    let isSameSubfolder = false;
-                    try {
-                      const startPathClean = startUrlObj.pathname.toLowerCase().replace(/\/+$/, "");
-                      const resolvedPathClean = resolved.pathname.toLowerCase().replace(/\/+$/, "");
-                      
-                      if (!startPathClean || startPathClean === "/" || startPathClean === "") {
-                        isSameSubfolder = true;
-                      } else {
-                        isSameSubfolder = resolvedPathClean.startsWith(startPathClean);
-                      }
-                    } catch (e) {
-                      isSameSubfolder = true;
-                    }
-
-                    if (!isSameSubfolder) return;
-
-                    if (!crawledUrls.has(cleanHref) && !queue.some((q) => q.url === cleanHref)) {
-                      const pathname = resolved.pathname.toLowerCase();
-                      const staticAssets = [".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".tar", ".gz", ".exe", ".dmg", ".mp4", ".css", ".js", ".json", ".xml", ".svg", ".avi"];
-                      if (!staticAssets.some((ext) => pathname.endsWith(ext))) {
-                        queue.push({ url: cleanHref, depth: current.depth + 1 });
-                      }
-                    }
-                  }
-                } catch (err) {
-                  // ignore
-                }
-              });
-            }
-
-            if (bodyText.length < 40) continue;
-
-            const sourceMetadata = `[출처 URL: ${current.url}]\n[크롤링 수준: Depth ${current.depth}]\n\n`;
-            const finalContent = sourceMetadata + bodyText;
-
-            const dbCurrent = readDb();
-            if (!dbCurrent.knowledgeBase) dbCurrent.knowledgeBase = [];
-
-            const combinedForTags = `${cleanTitle} ${bodyText}`.toLowerCase();
-            const autoTags = ["crawled", allowedHostname];
-            
-            const possibleTechKeywords = [
-              { key: "ufm", matches: ["ufm", "unified fabric manager", "ufm-sdn", "nvidia-sm"] },
-              { key: "lacp", matches: ["lacp", "bonding", "cl-net", "bond"] },
-              { key: "bonding", matches: ["bonding", "bond", "lacp"] },
-              { key: "bridge", matches: ["bridge", "vlan bridge", "브릿지", "브리짓"] },
-              { key: "vlan", matches: ["vlan", "vlans"] },
-              { key: "vxlan", matches: ["vxlan", "vxlans"] },
-              { key: "cumulus", matches: ["cumulus", "큐물러스"] },
-              { key: "infiniband", matches: ["infiniband", "인피니밴드", "mellanox", "hca"] },
-              { key: "opensm", matches: ["opensm", "openSM"] },
-              { key: "mstflint", matches: ["mstflint", "펌웨어", "firmware"] },
-              { key: "guid", matches: ["guid", "hca", "어댑터"] },
-              { key: "ibstat", matches: ["ibstat", "ibnetdiscover"] },
-              { key: "nvidia", matches: ["nvidia", "mellanox"] }
-            ];
-
-            possibleTechKeywords.forEach(t => {
-              if (t.matches.some(m => combinedForTags.includes(m))) {
-                if (!autoTags.includes(t.key)) {
-                  autoTags.push(t.key);
-                }
-              }
-            });
-
-            // Check if document already exists to avoid duplication
-            const existingIdx = dbCurrent.knowledgeBase.findIndex((doc: any) => {
-              if (doc.sourceUrl && doc.sourceUrl.toLowerCase().replace(/\/+$/, "") === current.url.toLowerCase().replace(/\/+$/, "")) return true;
-              if (cleanSourceTitle(doc.title) === cleanSourceTitle(cleanTitle)) return true;
-              return false;
-            });
-
-            if (existingIdx !== -1) {
-              dbCurrent.knowledgeBase[existingIdx] = {
-                ...dbCurrent.knowledgeBase[existingIdx],
-                title: `[웹사이트] ${cleanTitle}`,
-                tags: autoTags,
-                sourceUrl: current.url,
-                content: finalContent,
-                updatedAt: new Date().toISOString()
-              };
-            } else {
-              const targetId = `kb_crawl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-              const docItem = {
-                id: targetId,
-                title: `[웹사이트] ${cleanTitle}`,
-                category: docCategory,
-                tags: autoTags,
-                sourceUrl: current.url,
-                content: finalContent,
-                updatedAt: new Date().toISOString()
-              };
-              dbCurrent.knowledgeBase.unshift(docItem);
-            }
-
-            await writeDb(dbCurrent);
-            successCount++;
-
-          } catch (crawlErr: any) {
-            console.error(`[Auto-Recrawl] Error crawling ${current.url}:`, crawlErr.message || crawlErr);
-          }
-        }
-
-        // Complete source update
-        const dbPost = readDb();
-        if (!dbPost.sourceUrls) dbPost.sourceUrls = [];
-        const matchedSrcIdx = dbPost.sourceUrls.findIndex((item: any) => {
-          return item.url.toLowerCase().replace(/\/+$/, "") === startUrlObj.href.toLowerCase().replace(/\/+$/, "");
-        });
-
-        if (matchedSrcIdx !== -1) {
-          dbPost.sourceUrls[matchedSrcIdx].lastCrawledAt = new Date().toISOString();
-          dbPost.sourceUrls[matchedSrcIdx].count = successCount;
-          await writeDb(dbPost);
-        }
-
-        console.log(`[Auto-Recrawl] Auto-recrawl successfully completed for ${source.url}! Harvested ${successCount} documents.`);
-
-      } catch (crawlGlobalErr: any) {
-        console.error(`[Auto-Recrawl] Critical error in automatic crawling process for ${source.url}:`, crawlGlobalErr.message || crawlGlobalErr);
-      }
-    } else {
-      console.log(`[Auto-Recrawl] Source ${source.url} is up-to-date and has valid documents (Count: ${actualCount}개, Last: ${source.lastCrawledAt}).`);
+      const swap = await replaceCrawledDocsForSource(result.crawlRoot, result.chunks, (m) => console.log(`[Auto-Recrawl] ${m}`));
+      const dbPost = readDb();
+      upsertSourceConfig(dbPost, result.crawlRoot, {
+        lastCrawledAt: new Date().toISOString(),
+        count: swap.replaced ? result.chunks.length : actualCount,
+        lastResult: `pages ${result.pagesSaved}/${result.pagesAttempted}, chunks ${result.chunks.length}, errors ${result.errors.length}`,
+      });
+      await writeDb(dbPost);
+      console.log(`[Auto-Recrawl] Done ${source.url}: pages ${result.pagesSaved}/${result.pagesAttempted}, chunks ${result.chunks.length}`);
+    } catch (err: any) {
+      console.error(`[Auto-Recrawl] Failed for ${source.url}:`, err?.message || err);
     }
   }
 }
 
-   // Helper to detect if email is a reply, forward, or part of a thread
+// Helper to detect if email is a reply, forward, or part of a thread
 function checkIfReply(subject: string, body: string): boolean {
   const cleanSubject = (subject || "").trim().toLowerCase();
   
@@ -1045,6 +949,7 @@ function cleanDocumentForRag(content: string): string {
   let clean = content
     .replace(/^\[출처 URL:[^\]]+\]\s*/gmi, "")
     .replace(/^\[크롤링 수준:[^\]]+\]\s*/gmi, "")
+    .replace(/^\[페이지:[^\]]+\]\s*/gmi, "")
     .replace(/skip to main content/gi, "")
     .replace(/breadcrumbs/gi, "")
     .replace(/download pdf/gi, "")
@@ -1056,89 +961,77 @@ function cleanDocumentForRag(content: string): string {
   return clean;
 }
 
-// Clean HTML content removing navigation, sidebars, version switchers, and breadcrumbs
-function cleanHtmlContent(rawHtml: string, pageUrl: string): { title: string; content: string; childHrefs: string[] } {
-  const $ = cheerio.load(rawHtml);
-  
-  // 1. Collect child links BEFORE removing nav elements
-  const childHrefs: string[] = [];
-  $("a[href]").each((_, el) => {
-    const href = $(el).attr("href");
-    if (href) childHrefs.push(href);
-  });
+// cleanHtmlContent 는 server_crawler.ts 로 이동 (SVG <title> 혼입, 본문 선택자 body 고정 버그 수정, 표 변환 포함)
 
-  // 2. Remove all non-content and layout/navigation boilerplate
-  $(
-    "script, style, noscript, iframe, svg, nav, footer, header, head, " +
-    ".header, .footer, .nav, .sidebar, #sidebar, .menu, #menu, .banner, .ads, " +
-    ".wy-nav-side, .wy-side-scroll, .wy-breadcrumbs, .md-sidebar, .md-nav, .toc, .table-of-contents, " +
-    ".navigation, .navbar, [role='navigation'], [role='banner'], [role='contentinfo'], " +
-    ".version-switcher, .dropdown, button, form, input, .copyright, .feedback-section, .pagination, .page-nav, " +
-    ".skip-link, a[href='#main-content'], .layout-top, .search-container, .breadcrumbs, .breadcrumb, " +
-    ".rst-versions, .wy-nav-content-wrap > nav, .md-header, .md-tabs, .search-box"
-  ).remove();
+// ---------------------------------------------------------------------------
+// RAG context budget (문서당 / 전체) — 과도한 프롬프트로 Gemini 호출이 실패하는 것을 방지
+// ---------------------------------------------------------------------------
+const RAG_TOP_K = Math.max(1, parseInt(process.env.RAG_TOP_K || "5", 10) || 5);
+const RAG_EXCERPT_CHARS_PER_DOC = Math.max(500, parseInt(process.env.RAG_EXCERPT_CHARS_PER_DOC || "3500", 10) || 3500);
+const RAG_CONTEXT_MAX_CHARS = Math.max(2000, parseInt(process.env.RAG_CONTEXT_MAX_CHARS || "16000", 10) || 16000);
 
-  // Extract clean title
-  let title = $("title").text().trim();
-  if (!title) {
-    title = $("h1").first().text().trim() || pageUrl.replace(/^https?:\/\//i, "");
+/**
+ * 문서 전체 대신 질의 키워드와 관련 있는 문단만 발췌한다.
+ * - 문단(빈 줄 기준) 단위로 키워드 히트 수를 점수화하고, 코드블록/명령어가 포함된 문단에 가산점
+ * - 점수 높은 문단을 원문 순서대로 maxChars 까지 채움. 매칭 문단이 없으면 문서 앞부분을 반환
+ */
+function extractRelevantExcerpts(content: string, keywords: string[], maxChars: number = RAG_EXCERPT_CHARS_PER_DOC): string {
+  const clean = cleanDocumentForRag(content || "");
+  if (!clean) return "";
+  if (clean.length <= maxChars) return clean;
+
+  const kws = Array.from(new Set((keywords || []).map(k => String(k).toLowerCase()).filter(k => k.length >= 2)));
+  const paragraphs = clean.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+  const lowers = paragraphs.map(p => p.toLowerCase());
+
+  // 문서 안에서 대부분의 문단에 등장하는 키워드(예: 'nvidia')는 변별력이 없으므로 가중치를 낮춘다
+  const kwWeight = new Map<string, number>();
+  for (const kw of kws) {
+    const df = lowers.filter(l => l.includes(kw)).length;
+    const ratio = paragraphs.length > 0 ? df / paragraphs.length : 0;
+    const base = kw.length >= 4 ? 3 : 1;
+    kwWeight.set(kw, ratio > 0.5 ? base * 0.15 : base);
   }
-  title = cleanSourceTitle(title);
 
-  // Convert key tags for structured formatting
-  $("h1").each((_, el) => { $(el).replaceWith(`\n# ${$(el).text().trim()}\n`); });
-  $("h2").each((_, el) => { $(el).replaceWith(`\n## ${$(el).text().trim()}\n`); });
-  $("h3, h4, h5, h6").each((_, el) => { $(el).replaceWith(`\n### ${$(el).text().trim()}\n`); });
-  $("pre, code").each((_, el) => {
-    const codeText = $(el).text().trim();
-    if (codeText.includes("\n") || codeText.length > 20) {
-      $(el).replaceWith(`\n\`\`\`\n${codeText}\n\`\`\`\n`);
-    } else {
-      $(el).replaceWith(`\`${codeText}\``);
+  const scored = paragraphs.map((p, idx) => {
+    const lower = lowers[idx];
+    let score = 0;
+    for (const kw of kws) {
+      let pos = lower.indexOf(kw);
+      let hits = 0;
+      while (pos !== -1 && hits < 5) { hits++; pos = lower.indexOf(kw, pos + kw.length); }
+      score += hits * (kwWeight.get(kw) || 1);
     }
+    if (/```|^\$ |^sudo |^nv |^net |^ib[a-z]+|^mst|^ufm/m.test(p)) score += 2; // 명령어/코드 가산
+    if (/^#{1,3} /.test(p)) score += 1; // 제목 문단
+    return { idx, p, score };
   });
-  $("p").each((_, el) => { $(el).replaceWith(`\n${$(el).text().trim()}\n`); });
-  $("li").each((_, el) => { $(el).replaceWith(`\n- ${$(el).text().trim()}`); });
-  $("br").replaceWith("\n");
 
-  // Get raw body text or main article text
-  let mainText = $("main, article, [role='main'], .document, .content, .rst-content, .markdown-section, body").first().text() || $("body").text();
-
-  // Filter out line-level boilerplate
-  const boilerplatePatterns = [
-    /skip to main content/i,
-    /breadcrumbs/i,
-    /download pdf/i,
-    /chevron_right/i,
-    /v\d+\.\d+v\d+\.\d+/i,
-    /document revision history/i,
-    /copyright.*nvidia/i,
-    /all rights reserved/i,
-    /technical support/i,
-    /was this page helpful/i,
-    /feedback/i,
-  ];
-
-  const lines = mainText.split(/\r?\n/);
-  const cleanLines: string[] = [];
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (boilerplatePatterns.some(p => p.test(trimmed))) continue;
-    cleanLines.push(trimmed);
+  let matched = scored.filter(s => s.score > 0).sort((a, b) => b.score - a.score);
+  if (matched.length > 0) {
+    const minScore = matched[0].score * 0.2; // 최고 점수의 20% 미만 문단(배경 잡음)은 제외
+    matched = matched.filter(s => s.score >= minScore);
+  }
+  if (matched.length === 0) {
+    return clean.substring(0, maxChars) + "\n...[발췌: 문서 앞부분]";
   }
 
-  let content = cleanLines.join("\n\n").trim();
-  content = content.replace(/\n{3,}/g, "\n\n");
-
-  if (content.length > 25000) {
-    content = content.substring(0, 25000) + "\n\n...[지식 보관소 한도로 데이터 축약됨]";
+  const chosen: typeof matched = [];
+  let used = 0;
+  for (const m of matched) {
+    const len = m.p.length + 2;
+    if (used + len > maxChars) {
+      if (chosen.length === 0) { chosen.push({ ...m, p: m.p.substring(0, maxChars) }); }
+      continue;
+    }
+    chosen.push(m);
+    used += len;
   }
-
-  return { title, content, childHrefs };
+  chosen.sort((a, b) => a.idx - b.idx);
+  return chosen.map(c => c.p).join("\n\n") + `\n...[발췌: 관련 문단 ${chosen.length}/${paragraphs.length}]`;
 }
 
-// Synthesize a high-precision, structured Korean technical response based on matched documents
+// Synthesize a structured Korean technical response based on matched documents (Gemini 실패 시 fallback)
 function synthesizeRagAnswer(subject: string, body: string, matchedDocs: any[]): { answer: string; matchedSources: string[] } {
   if (!matchedDocs || matchedDocs.length === 0) {
     return {
@@ -1148,41 +1041,38 @@ function synthesizeRagAnswer(subject: string, body: string, matchedDocs: any[]):
   }
 
   const queryCombined = `${subject} ${body}`.toLowerCase();
+  const keywords = extractSearchKeywords(queryCombined);
   const matchedSources = Array.from(new Set(matchedDocs.map(d => formatShortSourceTitle(d.title || "")))).filter(Boolean);
 
-  // Check specific topic domains
+  let md = `### 📚 [지식베이스 검색 결과 - 로컬 발췌]\n\n`;
+  md += `AI 요약 호출이 실패하여 등록된 매뉴얼에서 질의와 관련된 문단을 발췌해 제공합니다. (재처리하면 AI 요약으로 대체됩니다)\n\n`;
+
+  const docsToShow = matchedDocs.slice(0, 3);
+  for (const d of docsToShow) {
+    const title = formatShortSourceTitle(d.title || "") || cleanSourceTitle(d.title || "");
+    const excerpt = extractRelevantExcerpts(d.content || "", keywords, 1200);
+    md += `**📄 ${title}**\n${excerpt}\n\n`;
+  }
+
+  // Actionable engineer tips (기존 유지)
   const isLacpLag = queryCombined.includes("lacp") || queryCombined.includes("lag") || queryCombined.includes("bonding") || queryCombined.includes("본딩");
-  const isVlanBridge = queryCombined.includes("vlan") || queryCombined.includes("bridge") || queryCombined.includes("브릿지") || queryCombined.includes("브리지");
   const isVxlanEvpn = queryCombined.includes("vxlan") || queryCombined.includes("evpn") || queryCombined.includes("multihoming") || queryCombined.includes("멀티호밍");
-  const isIbStat = queryCombined.includes("ibstat") || queryCombined.includes("link") || queryCombined.includes("속도") || queryCombined.includes("guid") || queryCombined.includes("ndr") || queryCombined.includes("hdr");
+  const isIbStat = queryCombined.includes("ibstat") || queryCombined.includes("속도") || queryCombined.includes("guid") || queryCombined.includes("ndr") || queryCombined.includes("hdr");
   const isFirmwareMst = queryCombined.includes("mstflint") || queryCombined.includes("firmware") || queryCombined.includes("펌웨어") || queryCombined.includes("mft");
   const isOpenSm = queryCombined.includes("opensm") || queryCombined.includes("subnet manager") || queryCombined.includes("서브넷");
-  const isUfm = queryCombined.includes("ufm") || queryCombined.includes("user management") || queryCombined.includes("계정");
 
-  let synthesizedMarkdown = `### 📚 [지식베이스 검색 결과]\n\n`;
-  synthesizedMarkdown += `등록된 기술 매뉴얼을 분석하여 핵심 구성 절차와 명령어를 요약했습니다.\n\n`;
-
-  // Excerpts are hidden from the final answer to prevent UI clutter and website noise.
-  // The UI already displays the sources as chips via `matchedSources`.
-
-  // Actionable engineer tips
   if (isLacpLag) {
-    synthesizedMarkdown += `**💡 엔지니어 추천 점검 팁 (LACP/LAG):**\n`;
-    synthesizedMarkdown += `- \`net show interface bond1\` 명령어로 LACP 파트너 상태(State) 및 멤버 포트(swp1, swp2)의 정상 바인딩 여부를 확인하십시오.\n`;
-    synthesizedMarkdown += `- 양단 스위치 간 MTU 불일치 및 LACP Rate(fast/slow) 설정을 상호 점검하세요.\n\n`;
+    md += `**💡 엔지니어 추천 점검 팁 (LACP/LAG):**\n- \`net show interface bond1\` 로 LACP 파트너 상태 및 멤버 포트 바인딩 여부를 확인하십시오.\n- 양단 MTU 불일치 및 LACP Rate(fast/slow) 설정을 상호 점검하세요.\n\n`;
   } else if (isVxlanEvpn) {
-    synthesizedMarkdown += `**💡 엔지니어 추천 점검 팁 (EVPN 멀티호밍):**\n`;
-    synthesizedMarkdown += `- \`net show evpn es\` 및 \`net show evpn mac\` 명령어로 양쪽 리프 스위치의 ESI 및 MAC 주소 동기화 상태를 확인하십시오.\n\n`;
+    md += `**💡 엔지니어 추천 점검 팁 (EVPN 멀티호밍):**\n- \`net show evpn es\` / \`net show evpn mac\` 으로 ESI 및 MAC 동기화 상태를 확인하십시오.\n\n`;
   } else if (isIbStat || isOpenSm) {
-    synthesizedMarkdown += `**💡 엔지니어 추천 점검 팁 (InfiniBand):**\n`;
-    synthesizedMarkdown += `- \`ibstat\` 출력에서 State가 \`Active\`, Physical state가 \`LinkUp\`인지 확인하십시오. \`Initializing\` 상태인 경우 서브넷 매니저(\`systemctl status opensm\`) 동작을 점검해야 합니다.\n\n`;
+    md += `**💡 엔지니어 추천 점검 팁 (InfiniBand):**\n- \`ibstat\` 의 State=Active, Physical state=LinkUp 여부를 확인하십시오. Initializing 이면 \`systemctl status opensm\` 을 점검하세요.\n\n`;
   } else if (isFirmwareMst) {
-    synthesizedMarkdown += `**💡 엔지니어 추천 점검 팁 (Mellanox Firmware):**\n`;
-    synthesizedMarkdown += `- 어댑터가 인식되지 않을 때는 \`mst start\`로 드라이버를 로드한 후 \`mstflint -d <PCI_ADDR> q\`로 펌웨어 쿼리를 실행하십시오.\n\n`;
+    md += `**💡 엔지니어 추천 점검 팁 (Mellanox Firmware):**\n- \`mst start\` 후 \`mstflint -d <PCI_ADDR> q\` 로 펌웨어를 조회하십시오.\n\n`;
   }
 
   return {
-    answer: synthesizedMarkdown.trim(),
+    answer: md.trim(),
     matchedSources
   };
 }
@@ -1223,9 +1113,21 @@ async function processEmailWithAI(subject: string, body: string, dateReceived: s
     ? (matchedDocsForGemini.length > 0 ? matchedDocsForGemini : (knowledgeDocs.length <= 5 ? knowledgeDocs : []))
     : [];
 
-  const kbContext = ragDocsToUse.length > 0 ? ragDocsToUse.map((doc: any) => {
-    return `[문서 ID: ${doc.id}]\n카테고리: ${doc.category}\n제목: ${cleanSourceTitle(doc.title || "")}\n태그: ${(doc.tags || []).join(", ")}\n내용:\n${cleanDocumentForRag(doc.content || "")}`;
-  }).join("\n\n=========================================\n\n") : "현재 메일 본문이 인피니밴드, UFM, 큐물러스 스위치 등 등록된 기술 지식베이스와 무관하여 RAG 검색이 트리거되지 않았습니다. 지식 창고 문서가 제공되지 않습니다.";
+  // 질의 키워드 기반 발췌만 프롬프트에 포함 (문서당 RAG_EXCERPT_CHARS_PER_DOC, 전체 RAG_CONTEXT_MAX_CHARS)
+  const ragQueryKeywords = extractSearchKeywords(`${subject} ${body}`.toLowerCase());
+  let kbContextBudget = RAG_CONTEXT_MAX_CHARS;
+  const kbContextParts: string[] = [];
+  for (const doc of ragDocsToUse) {
+    if (kbContextBudget <= 300) break;
+    const excerpt = extractRelevantExcerpts(doc.content || "", ragQueryKeywords, Math.min(RAG_EXCERPT_CHARS_PER_DOC, kbContextBudget));
+    const part = `[문서 ID: ${doc.id}]\n카테고리: ${doc.category}\n제목: ${cleanSourceTitle(doc.title || "")}\n태그: ${(doc.tags || []).join(", ")}\n내용(발췌):\n${excerpt}`;
+    kbContextParts.push(part);
+    kbContextBudget -= part.length;
+  }
+  const kbContext = kbContextParts.length > 0
+    ? kbContextParts.join("\n\n=========================================\n\n")
+    : "현재 메일 본문이 인피니밴드, UFM, 큐물러스 스위치 등 등록된 기술 지식베이스와 무관하여 RAG 검색이 트리거되지 않았습니다. 지식 창고 문서가 제공되지 않습니다.";
+  console.log(`[RAG] docs=${ragDocsToUse.length} contextChars=${kbContext.length}`);
 
   // Parse incoming date and convert it to Seoul local date/time so Gemini has accurate KST context
   const parsedDate = dateReceived ? new Date(dateReceived) : new Date();
@@ -1295,7 +1197,9 @@ ${forceRagInstruction}
 `;
 
   let lastError: any = null;
-  const modelsToTry = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-flash-latest"];
+  // GEMINI_MODELS="model-a,model-b" 로 재정의 가능. 존재하지 않는 모델은 404 로 즉시 다음 모델로 넘어감.
+  const modelsToTry = (process.env.GEMINI_MODELS || "gemini-3.6-flash,gemini-3.7-flash,gemini-flash-latest")
+    .split(",").map(m => m.trim()).filter(Boolean);
 
   if (ai) {
     for (const modelName of modelsToTry) {
@@ -1387,6 +1291,11 @@ ${forceRagInstruction}
           lastError = error;
           const errStr = (error.message || "").toLowerCase();
           const isRateLimit = errStr.includes("429") || errStr.includes("quota") || errStr.includes("rate") || errStr.includes("exhausted");
+          const isModelUnavailable = errStr.includes("404") || errStr.includes("not found") || errStr.includes("not supported") || errStr.includes("is not found");
+          if (isModelUnavailable) {
+            console.warn(`[Gemini] Model "${modelName}" unavailable — skipping to next model without retry.`);
+            break;
+          }
           
           console.error(`AI processing attempt ${attempt} with ${modelName} failed: ${error.message}`);
           
@@ -1403,21 +1312,28 @@ ${forceRagInstruction}
     lastError = new Error(initErrorMsg || "Gemini Client configuration not complete.");
   }
 
-  console.warn("[Gemini API Fallback] Deploying high-precision technical synthesizer fallback due to API error/quota limits.");
-  
-  // High-precision local keyword scoring-matching engine fallback with structured synthesizer
+  const fallbackReason = (lastError && lastError.message) ? String(lastError.message).substring(0, 300) : "unknown error";
+  console.warn(`[Gemini API Fallback] All model attempts failed (${fallbackReason}). Returning local fallback (no calendar registration unless CALENDAR_ON_AI_FALLBACK=true).`);
+
+  // 로컬 키워드 검색 + 발췌 기반 답변 (원문 본문은 캘린더에 넣지 않음)
   const matchedDocs = searchKnowledgeBase(subject, body, knowledgeDocs);
   const synthesized = synthesizeRagAnswer(subject, body, matchedDocs);
-  
+
+  // 본문 첫 문장만 짧게 (요약 대체가 아님을 명시)
+  const firstSentence = (processedBody || "").replace(/\s+/g, " ").trim().split(/(?<=[.!?。])\s|\n/)[0] || "";
+  const shortHint = firstSentence.length > 120 ? firstSentence.substring(0, 120) + "…" : firstSentence;
+
   return {
     has_event: false,
-    title: `[로컬 지능 요약] ${subject}`,
+    title: `[AI요약 실패] ${subject}`,
     start_time: anchorDateSeoul.substring(0, 10),
     end_time: anchorDateSeoul.substring(0, 10),
     is_all_day: true,
-    description: `[수신 메일 요약] 내용:\n${body.substring(0, 400)}${body.length > 400 ? "..." : ""}`,
+    description: `⚠️ Gemini AI 요약에 실패하여 자동 요약이 생성되지 않았습니다.\n사유: ${fallbackReason}\n\n메일 첫 문장: ${shortHint}\n\n처리 이력 화면에서 '재시도'하면 AI 요약을 다시 생성합니다.`,
     location: "",
-    reasoning: "지식베이스 검색 및 실시간 기술 매뉴얼 매칭을 수행하여 정밀 답변을 생성했습니다.",
+    reasoning: "Gemini 호출 실패로 로컬 fallback 이 사용되었습니다.",
+    ai_fallback: true,
+    ai_error: fallbackReason,
     ragAnswer: {
       triggered: true,
       answer: synthesized.answer,
@@ -1461,7 +1377,7 @@ function extractSearchKeywords(query: string): string[] {
 }
 
 // Scored-based Search Engine for High-Fidelity RAG matching
-function searchKnowledgeBase(subject: string, body: string, docs: any[]): any[] {
+function searchKnowledgeBase(subject: string, body: string, docs: any[], topK: number = RAG_TOP_K): any[] {
   const query = `${subject} ${body}`.toLowerCase().trim();
   const rawKeywords = extractSearchKeywords(query);
 
@@ -1517,6 +1433,15 @@ function searchKnowledgeBase(subject: string, body: string, docs: any[]): any[] 
 
   const keywordsArray = Array.from(expandedKeywords);
 
+  const commonKeywords = new Set<string>();
+  if (docs.length >= 5) {
+    const docBlobs = docs.map(d => `${cleanSourceTitle(d.title || "")} ${(d.tags || []).join(" ")} ${d.content || ""}`.toLowerCase());
+    for (const kw of keywordsArray) {
+      const df = docBlobs.filter(b => b.includes(kw)).length;
+      if (df / docs.length >= 0.7) commonKeywords.add(kw);
+    }
+  }
+
   const scoredDocs = docs.map(docItem => {
     let score = 0;
     const title = cleanSourceTitle(docItem.title || "").toLowerCase();
@@ -1526,6 +1451,7 @@ function searchKnowledgeBase(subject: string, body: string, docs: any[]): any[] 
 
     // Iterate through key search terms and accumulate search signal strength
     keywordsArray.forEach(kw => {
+      if (commonKeywords.has(kw)) return; // 변별력 없는 공통 키워드는 건너뜀
       // 1. Tag matches (high priority)
       tags.forEach((tag: string) => {
         if (tag === kw) {
@@ -1562,7 +1488,8 @@ function searchKnowledgeBase(subject: string, body: string, docs: any[]): any[] 
     });
 
     // 4. Boost significantly if ALL RAW keywords match
-    const matchesAllKeywords = rawKeywords.every(kw => {
+    const discriminativeRaw = rawKeywords.filter(kw => !commonKeywords.has(kw));
+    const matchesAllKeywords = discriminativeRaw.length > 0 && discriminativeRaw.every(kw => {
       const synonyms = [kw];
       if (kw === "lag") synonyms.push("lacp", "bonding", "bond");
       if (kw === "lacp" || kw === "bonding" || kw === "bond" || kw === "본딩") synonyms.push("lag", "lacp", "bonding", "bond");
@@ -1595,7 +1522,8 @@ function searchKnowledgeBase(subject: string, body: string, docs: any[]): any[] 
     }
   }
 
-  return uniqueDocs;
+  // 상위 K개만 반환 — 점수 18점 이상 문서를 전부 넘기면 프롬프트가 폭주해 Gemini 호출이 실패함
+  return uniqueDocs.slice(0, Math.max(1, topK));
 }
 
 // Helper function to format date/time components in Asia/Seoul timezone.
@@ -2055,6 +1983,7 @@ app.post("/api/auth/clear", async (req, res) => {
   db.credentials.refreshToken = "";
   db.credentials.tokenExpiry = 0;
   db.credentials.userEmail = "";
+  allowCredentialWipe = true;
   await writeDb(db);
   res.json({ success: true, message: "Logged out / Disconnected successfully!" });
 });
@@ -2070,6 +1999,7 @@ app.post("/api/auth/reset-credentials", async (req, res) => {
     tokenExpiry: 0,
     userEmail: ""
   };
+  allowCredentialWipe = true;
   await writeDb(db);
   res.json({ success: true, message: "OAuth Client ID & Client Secret have been reset!" });
 });
@@ -2129,6 +2059,7 @@ app.post("/api/history/delete", async (req, res) => {
       }
     }
     db.history = [];
+    histSyncSig.clear();
   } else if (id) {
     if (firestoreDb) {
       try {
@@ -2139,6 +2070,7 @@ app.post("/api/history/delete", async (req, res) => {
         console.warn(`[Firebase] Failed to delete history item ${id} from Firestore:`, err);
       }
     }
+    histSyncSig.delete(id);
     db.history = db.history.filter((item: any) => item.id !== id);
   }
 
@@ -2163,6 +2095,7 @@ app.get("/api/knowledge-base", async (req, res) => {
 // Explicit retry sync endpoint for RAG Workspace
 app.post("/api/knowledge-base/retry-sync", async (req, res) => {
   const success = await syncFromFirestore();
+  if (success) bootSyncOk = true;
   const db = readDb();
   res.json({
     success,
@@ -2243,21 +2176,7 @@ app.post("/api/knowledge-base/sources/delete", async (req, res) => {
 
       if (db.knowledgeBase) {
         const initialLen = db.knowledgeBase.length;
-        const itemsToDelete = db.knowledgeBase.filter((doc: any) => {
-          if (!doc.id.startsWith("kb_crawl_")) return false;
-          if (doc.sourceUrl) {
-            return doc.sourceUrl.toLowerCase().replace(/\/+$/, "") === resolvedUrl.toLowerCase().replace(/\/+$/, "");
-          }
-          if (doc.content) {
-            const match = doc.content.match(/\[출처 URL: ([^\]]+)\]/);
-            if (match && match[1]) {
-              const cleanDocUrl = match[1].toLowerCase().trim().replace(/\/+$/, "");
-              const cleanStartUrl = resolvedUrl.toLowerCase().trim().replace(/\/+$/, "");
-              return cleanDocUrl.startsWith(cleanStartUrl) || cleanDocUrl === cleanStartUrl;
-            }
-          }
-          return false;
-        });
+        const itemsToDelete = db.knowledgeBase.filter((doc: any) => docBelongsToSource(doc, resolvedUrl));
 
         db.knowledgeBase = db.knowledgeBase.filter(
           (doc: any) => !itemsToDelete.some((delItem: any) => delItem.id === doc.id)
@@ -2275,6 +2194,7 @@ app.post("/api/knowledge-base/sources/delete", async (req, res) => {
             } catch (fbErr) {
               console.warn(`[Firebase] Error deleting doc ${item.id}:`, fbErr);
             }
+            kbSyncSig.delete(item.id);
           }
         }
       }
@@ -2330,6 +2250,7 @@ app.post("/api/knowledge-base/delete", async (req, res) => {
   const db = readDb();
   if (db.knowledgeBase) {
     db.knowledgeBase = db.knowledgeBase.filter((doc: any) => doc.id !== id);
+    kbSyncSig.delete(id);
     await writeDb(db);
   }
 
@@ -2355,70 +2276,49 @@ app.post("/api/knowledge-base/crawl", async (req, res) => {
     return res.status(400).json({ error: "crawling URL is required." });
   }
 
-  // Set up streaming response header
+  // Streaming (NDJSON) response
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
 
+  let clientGone = false;
+  res.on("close", () => { clientGone = true; });
+
   const sendLog = (data: any) => {
-    res.write(JSON.stringify(data) + "\n");
-    if (typeof (res as any).flush === "function") {
-      (res as any).flush();
+    if (clientGone) return; // 클라이언트가 끊겨도 크롤은 끝까지 진행하고 저장한다
+    try {
+      res.write(JSON.stringify(data) + "\n");
+      if (typeof (res as any).flush === "function") (res as any).flush();
+    } catch {
+      clientGone = true;
     }
   };
 
   const heartbeat = setInterval(() => {
+    if (clientGone) { clearInterval(heartbeat); return; }
     try {
       res.write(": keepalive\n\n");
-      if (typeof (res as any).flush === "function") {
-        (res as any).flush();
-      }
-    } catch (err) {
+      if (typeof (res as any).flush === "function") (res as any).flush();
+    } catch {
       clearInterval(heartbeat);
     }
   }, 4500);
 
   try {
-    let resolvedUrl = url.trim();
-    if (!/^https?:\/\//i.test(resolvedUrl)) {
-      resolvedUrl = "https://" + resolvedUrl;
-    }
-
+    let resolvedUrl = String(url).trim();
+    if (!/^https?:\/\//i.test(resolvedUrl)) resolvedUrl = "https://" + resolvedUrl;
     const startUrlObj = new URL(resolvedUrl);
-    const allowedHostname = startUrlObj.hostname;
-    const allowedOrigin = startUrlObj.origin;
 
-    const pagesToCrawl = Math.min(Math.max(parseInt(maxPages, 10) || 10, 1), 50);
-    const depthToCrawl = Math.min(Math.max(parseInt(maxDepth, 10) || 2, 1), 4);
-    const docCategory = category?.trim() || "Crawled Web";
+    const pagesToCrawl = Math.min(Math.max(parseInt(maxPages, 10) || 10, 1), CRAWL_MAX_PAGES_CAP);
+    const depthToCrawl = Math.min(Math.max(parseInt(maxDepth, 10) || 2, 1), CRAWL_MAX_DEPTH_CAP);
+    const docCategory = (category && String(category).trim()) || "Crawled Web";
 
-    // Pre-register/save source URL settings in DB immediately so the UI is updated dynamically with the new site config
+    // 소스 설정 선등록 (UI 즉시 반영)
     try {
       const preDb = readDb();
-      if (!preDb.sourceUrls) preDb.sourceUrls = [];
-      const matchedIdx = preDb.sourceUrls.findIndex((item: any) => {
-        return item.url.toLowerCase().replace(/\/+$/, "") === startUrlObj.href.toLowerCase().replace(/\/+$/, "");
-      });
-
-      if (matchedIdx !== -1) {
-        preDb.sourceUrls[matchedIdx].lastCrawledAt = new Date().toISOString();
-        preDb.sourceUrls[matchedIdx].maxPages = pagesToCrawl;
-        preDb.sourceUrls[matchedIdx].maxDepth = depthToCrawl;
-        preDb.sourceUrls[matchedIdx].category = docCategory;
-      } else {
-        preDb.sourceUrls.unshift({
-          id: `src_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-          url: startUrlObj.href,
-          maxPages: pagesToCrawl,
-          maxDepth: depthToCrawl,
-          category: docCategory,
-          createdAt: new Date().toISOString(),
-          lastCrawledAt: new Date().toISOString(),
-          count: 0
-        });
-      }
+      upsertSourceConfig(preDb, startUrlObj.href, { maxPages: pagesToCrawl, maxDepth: depthToCrawl, category: docCategory, lastCrawledAt: new Date().toISOString() });
       await writeDb(preDb);
     } catch (preErr) {
       console.error("Failed to pre-register source URL in local DB:", preErr);
@@ -2426,306 +2326,43 @@ app.post("/api/knowledge-base/crawl", async (req, res) => {
 
     sendLog({ type: "start", message: `🕷️ Web crawler initialized. Target: ${startUrlObj.href} (Max pages: ${pagesToCrawl}, Max depth: ${depthToCrawl})` });
 
-    // Clean up older documents of this specific source before crawling to prevent duplication/accumulation
-    try {
-      const dbCurrent = readDb();
-      const itemsToDelete = (dbCurrent.knowledgeBase || []).filter((doc: any) => {
-        if (!doc.id || !doc.id.startsWith("kb_crawl_")) return false;
-        if (doc.sourceUrl) {
-          return doc.sourceUrl.toLowerCase().replace(/\/+$/, "") === startUrlObj.href.toLowerCase().replace(/\/+$/, "");
-        }
-        if (doc.content) {
-          const match = doc.content.match(/\[출처 URL: ([^\]]+)\]/);
-          if (match && match[1]) {
-            const cleanDocUrl = match[1].toLowerCase().trim().replace(/\/+$/, "");
-            const cleanStartUrl = startUrlObj.href.toLowerCase().trim().replace(/\/+$/, "");
-            return cleanDocUrl.startsWith(cleanStartUrl) || cleanDocUrl === cleanStartUrl;
-          }
-        }
-        return false;
-      });
+    const result = await crawlSite({
+      startUrl: startUrlObj.href,
+      maxPages: pagesToCrawl,
+      maxDepth: depthToCrawl,
+      category: docCategory,
+      log: (message, type, extra) => sendLog({ type: type || "progress", message, ...(extra || {}) }),
+    });
 
-      if (itemsToDelete.length > 0) {
-        sendLog({ type: "progress", message: `🧹 Cleaning ${itemsToDelete.length} previously crawled documents for this source before starting fresh...` });
-        dbCurrent.knowledgeBase = dbCurrent.knowledgeBase.filter(
-          (doc: any) => !itemsToDelete.some((delItem: any) => delItem.id === doc.id)
-        );
-        
-        // Sync deletion to Firestore
-        if (firestoreDb) {
-          for (const delDoc of itemsToDelete) {
-            try {
-              const docRef = doc(firestoreDb, "app_state", "main", "knowledge_base", delDoc.id);
-              await deleteDoc(docRef);
-            } catch (fbErr) {
-              // ignore
-            }
-          }
-        }
-        await writeDb(dbCurrent);
-      }
-    } catch (cleanErr: any) {
-      console.error("Failed to clean up old documents before crawling:", cleanErr);
+    // 기존 문서를 새 결과로 교체 (새 결과 0건이면 기존 유지)
+    const swap = await replaceCrawledDocsForSource(result.crawlRoot, result.chunks, (m) => sendLog({ type: "progress", message: m }));
+
+    const finalDb = readDb();
+    const docCount = (finalDb.knowledgeBase || []).filter((d: any) => docBelongsToSource(d, result.crawlRoot)).length;
+    upsertSourceConfig(finalDb, result.crawlRoot, {
+      lastCrawledAt: new Date().toISOString(),
+      count: docCount,
+      maxPages: pagesToCrawl,
+      maxDepth: depthToCrawl,
+      category: docCategory,
+      lastResult: `pages ${result.pagesSaved}/${result.pagesAttempted}, chunks ${result.chunks.length}, errors ${result.errors.length}`,
+    });
+    await writeDb(finalDb);
+
+    if (lastFirestoreError) {
+      sendLog({ type: "warning", message: `⚠️ Firestore 저장 일부 실패 (다음 저장 시 재시도): ${lastFirestoreError}` });
     }
-
-    const queue: { url: string; depth: number }[] = [{ url: startUrlObj.href, depth: 1 }];
-    const crawledUrls = new Set<string>();
-    let successCount = 0;
-
-    const fetchWithTimeout = async (targetUrl: string, timeoutMs = 6000) => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      try {
-        const response = await fetch(targetUrl, {
-          signal: controller.signal,
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache"
-          }
-        });
-        clearTimeout(timer);
-        return response;
-      } catch (err) {
-        clearTimeout(timer);
-        throw err;
-      }
-    };
-
-    while (queue.length > 0 && crawledUrls.size < pagesToCrawl) {
-      const current = queue.shift();
-      if (!current) continue;
-
-      if (crawledUrls.has(current.url)) {
-        continue;
-      }
-
-      crawledUrls.add(current.url);
-      sendLog({ type: "progress", message: `➡️ Fetching level ${current.depth} URL [${crawledUrls.size}/${pagesToCrawl}]: ${current.url}` });
-
-      try {
-        // Politeness delay
-        await new Promise((resolve) => setTimeout(resolve, 300));
-
-        const response = await fetchWithTimeout(current.url);
-        if (!response.ok) {
-          sendLog({ type: "warning", message: `⚠️ HTTP error ${response.status} fetching ${current.url}. Skipping.` });
-          continue;
-        }
-
-        const contentType = response.headers.get("content-type") || "";
-        if (!contentType.toLowerCase().includes("text/html")) {
-          sendLog({ type: "warning", message: `⚠️ Skipped non-HTML contentType (${contentType}) at ${current.url}` });
-          continue;
-        }
-
-        const html = await response.text();
-        const { title: cleanPageTitle, content: bodyText, childHrefs } = cleanHtmlContent(html, current.url);
-
-        // Add child URLs to queue if depth limit allows
-        if (current.depth < depthToCrawl) {
-          let linkCount = 0;
-          childHrefs.forEach((href) => {
-            try {
-              const resolved = new URL(href, current.url);
-              // Deep link security and scoping (Strictly same hostname)
-              if (resolved.hostname === allowedHostname && (resolved.protocol === "http:" || resolved.protocol === "https:")) {
-                resolved.hash = ""; // Strip sections to treat as single URL
-                const cleanHref = resolved.href;
-
-                // Subfolder/path scoping: Only crawl URLs sharing the start path prefix to avoid domain-wide crawling
-                let isSameSubfolder = false;
-                try {
-                  const startPathClean = startUrlObj.pathname.toLowerCase().replace(/\/+$/, "");
-                  const resolvedPathClean = resolved.pathname.toLowerCase().replace(/\/+$/, "");
-                  
-                  if (!startPathClean || startPathClean === "/" || startPathClean === "") {
-                    isSameSubfolder = true;
-                  } else {
-                    if (resolvedPathClean.startsWith(startPathClean)) {
-                      isSameSubfolder = true;
-                    } else {
-                      const lastSlashStart = startPathClean.lastIndexOf("/");
-                      if (lastSlashStart > 0) {
-                        const parentPath = startPathClean.substring(0, lastSlashStart);
-                        if (parentPath && parentPath !== "/" && parentPath.length > 5) {
-                          isSameSubfolder = resolvedPathClean.startsWith(parentPath);
-                        }
-                      }
-                    }
-                  }
-                } catch (e) {
-                  isSameSubfolder = true; // Fallback
-                }
-
-                if (!isSameSubfolder) {
-                  return; // Skip links outside current documentation scope or parent branch
-                }
-
-                if (!crawledUrls.has(cleanHref) && !queue.some((q) => q.url === cleanHref)) {
-                  const pathname = resolved.pathname.toLowerCase();
-                  const staticAssets = [".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".tar", ".gz", ".exe", ".dmg", ".mp4", ".css", ".js", ".json", ".xml", ".svg", ".avi"];
-                  if (!staticAssets.some((ext) => pathname.endsWith(ext))) {
-                    queue.push({ url: cleanHref, depth: current.depth + 1 });
-                    linkCount++;
-                  }
-                }
-              }
-            } catch (err) {
-              // Ignore invalid url structures
-            }
-          });
-          if (linkCount > 0) {
-            sendLog({ type: "progress", message: `   Found ${linkCount} new sub-URLs on same host added to queue.` });
-          }
-        }
-
-        if (bodyText.length < 40) {
-          sendLog({ type: "warning", message: `⚠️ Content on ${current.url} seems too short or empty. Skipping storage.` });
-          continue;
-        }
-
-        const sourceMetadata = `[출처 URL: ${current.url}]\n[크롤링 수준: Depth ${current.depth}]\n\n`;
-        const finalContent = sourceMetadata + bodyText;
-
-        // Save into local Database immediately
-        const db = readDb();
-        if (!db.knowledgeBase) db.knowledgeBase = [];
-
-        // Intelligent automatic tag indexing system for maximum RAG accuracy
-        const combinedForTags = `${cleanPageTitle} ${bodyText}`.toLowerCase();
-        const autoTags = ["crawled", allowedHostname];
-        
-        const possibleTechKeywords = [
-          { key: "ufm", matches: ["ufm", "unified fabric manager", "ufm-sdn", "nvidia-sm"] },
-          { key: "lacp", matches: ["lacp", "bonding", "cl-net", "bond"] },
-          { key: "bonding", matches: ["bonding", "bond", "lacp"] },
-          { key: "bridge", matches: ["bridge", "vlan bridge", "브릿지", "브리짓"] },
-          { key: "vlan", matches: ["vlan", "vlans"] },
-          { key: "vxlan", matches: ["vxlan", "vxlans"] },
-          { key: "cumulus", matches: ["cumulus", "큐물러스"] },
-          { key: "infiniband", matches: ["infiniband", "인피니밴드", "mellanox", "hca"] },
-          { key: "opensm", matches: ["opensm", "openSM"] },
-          { key: "mstflint", matches: ["mstflint", "펌웨어", "firmware"] },
-          { key: "guid", matches: ["guid", "hca", "어댑터"] },
-          { key: "ibstat", matches: ["ibstat", "ibnetdiscover"] },
-          { key: "nvidia", matches: ["nvidia", "mellanox"] }
-        ];
-
-        possibleTechKeywords.forEach(t => {
-          if (t.matches.some(m => combinedForTags.includes(m))) {
-            if (!autoTags.includes(t.key)) {
-              autoTags.push(t.key);
-            }
-          }
-        });
-
-        // Check if document already exists to avoid duplication
-        const existingIdx = db.knowledgeBase.findIndex((doc: any) => {
-          if (doc.sourceUrl && doc.sourceUrl.toLowerCase().replace(/\/+$/, "") === current.url.toLowerCase().replace(/\/+$/, "")) return true;
-          if (cleanSourceTitle(doc.title) === cleanSourceTitle(cleanPageTitle)) return true;
-          return false;
-        });
-
-        let savedDocId = "";
-        if (existingIdx !== -1) {
-          savedDocId = db.knowledgeBase[existingIdx].id;
-          db.knowledgeBase[existingIdx] = {
-            ...db.knowledgeBase[existingIdx],
-            title: `[웹사이트] ${cleanPageTitle}`,
-            tags: autoTags,
-            sourceUrl: current.url,
-            content: finalContent,
-            updatedAt: new Date().toISOString()
-          };
-        } else {
-          savedDocId = `kb_crawl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-          const docItem = {
-            id: savedDocId,
-            title: `[웹사이트] ${cleanPageTitle}`,
-            category: docCategory,
-            tags: autoTags,
-            sourceUrl: current.url,
-            content: finalContent,
-            updatedAt: new Date().toISOString()
-          };
-          db.knowledgeBase.unshift(docItem);
-        }
-
-        await writeDb(db);
-
-        successCount++;
-        sendLog({ 
-          type: "saved", 
-          message: `✅ Saved: "${cleanPageTitle}" (${bodyText.length} characters)`, 
-          docId: savedDocId, 
-          title: cleanPageTitle, 
-          url: current.url
-        });
-
-      } catch (crawlErr: any) {
-        sendLog({ type: "warning", message: `❌ Error crawling ${current.url}: ${crawlErr.message || "Unknown Network Error"}` });
-      }
-    }
-
-    try {
-      const finalDb = readDb();
-      if (!finalDb.sourceUrls) finalDb.sourceUrls = [];
-
-      // Find count of documents that belong to this starting source URL
-      const docCount = (finalDb.knowledgeBase || []).filter((doc: any) => {
-        if (!doc.id.startsWith("kb_crawl_")) return false;
-        if (doc.sourceUrl) {
-          return doc.sourceUrl.toLowerCase().replace(/\/+$/, "") === startUrlObj.href.toLowerCase().replace(/\/+$/, "");
-        }
-        if (doc.content) {
-          const match = doc.content.match(/\[출처 URL: ([^\]]+)\]/);
-          if (match && match[1]) {
-            const cleanDocUrl = match[1].toLowerCase().trim().replace(/\/+$/, "");
-            const cleanStartUrl = startUrlObj.href.toLowerCase().trim().replace(/\/+$/, "");
-            return cleanDocUrl.startsWith(cleanStartUrl) || cleanDocUrl === cleanStartUrl;
-          }
-        }
-        return false;
-      }).length;
-
-      const matchedSrcIdx = finalDb.sourceUrls.findIndex((item: any) => {
-        return item.url.toLowerCase().replace(/\/+$/, "") === startUrlObj.href.toLowerCase().replace(/\/+$/, "");
-      });
-
-      if (matchedSrcIdx !== -1) {
-        finalDb.sourceUrls[matchedSrcIdx].lastCrawledAt = new Date().toISOString();
-        finalDb.sourceUrls[matchedSrcIdx].count = docCount;
-        finalDb.sourceUrls[matchedSrcIdx].maxPages = pagesToCrawl;
-        finalDb.sourceUrls[matchedSrcIdx].maxDepth = depthToCrawl;
-        finalDb.sourceUrls[matchedSrcIdx].category = docCategory;
-      } else {
-        finalDb.sourceUrls.unshift({
-          id: `src_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-          url: startUrlObj.href,
-          maxPages: pagesToCrawl,
-          maxDepth: depthToCrawl,
-          category: docCategory,
-          createdAt: new Date().toISOString(),
-          lastCrawledAt: new Date().toISOString(),
-          count: docCount
-        });
-      }
-      await writeDb(finalDb);
-    } catch (dbErr) {
-      console.error("Failed to automatically register source URL:", dbErr);
-    }
-
-    sendLog({ type: "complete", message: `🎉 Crawling complete! Successfully harvested ${successCount} documents from ${crawledUrls.size} page attempts.`, count: successCount });
-    clearInterval(heartbeat);
-    res.end();
-
+    sendLog({
+      type: "complete",
+      message: `🎉 Crawling complete! Pages saved ${result.pagesSaved}/${result.pagesAttempted}, chunks ${result.chunks.length}${swap.replaced ? "" : " (기존 문서 유지)"}. Scope: ${result.scopeOrigin}${result.scopePath}`,
+      count: docCount,
+    });
   } catch (globalErr: any) {
-    sendLog({ type: "error", message: `🚨 Critical crawling failure: ${globalErr.message || "Scrawler halted"}` });
+    console.error("Crawl failure:", globalErr);
+    sendLog({ type: "error", message: `🚨 Critical crawling failure: ${globalErr?.message || "Crawler halted"}` });
+  } finally {
     clearInterval(heartbeat);
-    res.end();
+    try { res.end(); } catch { /* ignore */ }
   }
 });
 
@@ -2765,7 +2402,7 @@ async function registerCalendarWithRetryBackground(logId: string) {
       logItem.status = "retrying";
       logItem.errorMessage = `일시적인 구글 연동 장애로 자동 예약 재시도 중입니다... (재시도 중: ${attempt}/3회차, 약 40초 간격)`;
       db.history[logIndex] = logItem;
-      writeDb(db);
+      await writeDb(db);
     }
 
     try {
@@ -2787,7 +2424,7 @@ async function registerCalendarWithRetryBackground(logId: string) {
         finalDb.history[finalIdx].calendarEventLink = googleEventResult.htmlLink || "";
         finalDb.history[finalIdx].status = "success";
         finalDb.history[finalIdx].errorMessage = "";
-        writeDb(finalDb);
+        await writeDb(finalDb);
       }
       console.log(`[Retry Task Log ${logId}] Succeeded on attempt ${attempt + 1}!`);
       return;
@@ -2805,14 +2442,16 @@ async function registerCalendarWithRetryBackground(logId: string) {
       const errorIdx = errorDb.history.findIndex((item: any) => item.id === logId);
       if (errorIdx !== -1) {
         if (isAuthError) {
-          // Break cycle and clear credentials if it's an authentication block
+          // Break cycle and mark token expiry so next call tries refreshToken if present
           errorDb.history[errorIdx].status = "pending_calendar";
           errorDb.history[errorIdx].errorMessage = "구글 캘린더 연동 세션이 만료되었습니다. 상단의 'Sign in with Google'을 다시 연동해 주세요.";
           if (errorDb.credentials) {
-            errorDb.credentials.accessToken = "";
+            if (!errorDb.credentials.refreshToken) {
+              errorDb.credentials.accessToken = "";
+            }
             errorDb.credentials.tokenExpiry = 0;
           }
-          writeDb(errorDb);
+          await writeDb(errorDb);
           return;
         }
 
@@ -2820,11 +2459,11 @@ async function registerCalendarWithRetryBackground(logId: string) {
         if (attempt === maxRetries) {
           errorDb.history[errorIdx].status = "failed_calendar";
           errorDb.history[errorIdx].errorMessage = `구글 일정 등록이 일시적 장애(네트워크 등)로 인해 3회 자동 재시도했으나 최종 실패했습니다. (최종 오류: ${err.message})`;
-          writeDb(errorDb);
+          await writeDb(errorDb);
         } else {
           // Keep current failure description for the UI to show
           errorDb.history[errorIdx].errorMessage = `일정 등록 시도 실패: ${err.message}. 잠시 후 자동 재시도합니다... (대기 중)`;
-          writeDb(errorDb);
+          await writeDb(errorDb);
         }
       }
 
@@ -2858,19 +2497,35 @@ app.post("/api/history/retry", async (req, res) => {
   // Update status to processing
   historyEntry.status = "processing";
   historyEntry.errorMessage = "구글 일정 자동 등록 시도 중...";
-  writeDb(db);
+  await writeDb(db);
 
   try {
     let aiResult = historyEntry.aiSummary;
 
-    // 1. If AI summary is not yet captured (completely failed run earlier), re-extract with Gemini
-    if (!aiResult) {
-      console.log(`[Retry] AI Summary missing for Log ${id}. Re-running Gemini parsing...`);
+    // 1. If AI summary is not yet captured or previously fell back due to AI error, re-extract with Gemini
+    const preservedAttachments = historyEntry.attachmentNames || historyEntry.aiSummary?.attachmentNames || [];
+    if (!aiResult || aiResult.ai_fallback) {
+      console.log(`[Retry] AI Summary missing or fallback for Log ${id}. Re-running Gemini parsing...`);
       aiResult = await processEmailWithAI(historyEntry.subject, historyEntry.body, historyEntry.dateReceived);
+      if (aiResult && preservedAttachments.length > 0) {
+        aiResult.attachmentNames = preservedAttachments;
+      }
       historyEntry.isReply = checkIfReply(historyEntry.subject, historyEntry.body);
       historyEntry.hasEvent = aiResult.has_event;
       historyEntry.aiSummary = aiResult;
-    if (aiResult) aiResult.attachmentNames = attachmentNames;
+
+      if (aiResult && aiResult.ai_fallback) {
+        const allowCalendar = String(process.env.CALENDAR_ON_AI_FALLBACK || "false").toLowerCase() === "true";
+        if (!allowCalendar) {
+          historyEntry.status = "failed";
+          historyEntry.errorMessage = `Gemini AI 요약 실패로 캘린더 등록을 보류했습니다. (${aiResult.ai_error || "unknown"}) '재시도'로 다시 처리하세요.`;
+          const dbFallback = readDb();
+          const idx = dbFallback.history.findIndex((item: any) => item.id === id);
+          if (idx !== -1) dbFallback.history[idx] = historyEntry;
+          await writeDb(dbFallback);
+          return res.status(502).json({ error: historyEntry.errorMessage, log: historyEntry });
+        }
+      }
     } else if (historyEntry.isReply === undefined) {
       historyEntry.isReply = checkIfReply(historyEntry.subject, historyEntry.body);
     }
@@ -2881,7 +2536,7 @@ app.post("/api/history/retry", async (req, res) => {
     if (index !== -1) {
       dbSave.history[index] = historyEntry;
     }
-    writeDb(dbSave);
+    await writeDb(dbSave);
 
     // 2. Start background worker with 3 automatic retries
     registerCalendarWithRetryBackground(id);
@@ -2897,7 +2552,7 @@ app.post("/api/history/retry", async (req, res) => {
     if (index !== -1) {
       dbSave.history[index] = historyEntry;
     }
-    writeDb(dbSave);
+    await writeDb(dbSave);
 
     return res.status(500).json({ error: err.message });
   }
@@ -2933,7 +2588,24 @@ async function executeWorkflow(subject: string, body: string, dateReceived: stri
     // Overwrite with processed reply status if Gemini context or formatting updated it
     historyEntry.isReply = isReply;
     historyEntry.hasEvent = aiResult.has_event;
+    if (aiResult && attachmentNames && attachmentNames.length > 0) {
+      aiResult.attachmentNames = attachmentNames;
+    }
+    historyEntry.attachmentNames = attachmentNames;
     historyEntry.aiSummary = aiResult;
+
+    // Gemini 전 모델 실패 → 로컬 fallback. 원문이 캘린더에 그대로 올라가지 않도록 기본적으로 등록을 보류한다.
+    if (aiResult && aiResult.ai_fallback) {
+      const allowCalendar = String(process.env.CALENDAR_ON_AI_FALLBACK || "false").toLowerCase() === "true";
+      if (!allowCalendar) {
+        historyEntry.status = "failed";
+        historyEntry.errorMessage = `Gemini AI 요약 실패로 캘린더 등록을 보류했습니다. (${aiResult.ai_error || "unknown"}) '재시도'로 다시 처리하세요.`;
+        const dbFallback = readDb();
+        dbFallback.history.unshift(historyEntry);
+        await writeDb(dbFallback);
+        return historyEntry;
+      }
+    }
   } catch (error: any) {
     console.error("AI processing error:", error);
     historyEntry.status = "failed";
@@ -2950,7 +2622,7 @@ async function executeWorkflow(subject: string, body: string, dateReceived: stri
     // Save failed entry
     const db = readDb();
     db.history.unshift(historyEntry);
-    writeDb(db);
+    await writeDb(db);
     return historyEntry;
   }
 
@@ -2965,7 +2637,7 @@ async function executeWorkflow(subject: string, body: string, dateReceived: stri
     // Write back to DB logs
     const dbSave = readDb();
     dbSave.history.unshift(historyEntry);
-    writeDb(dbSave);
+    await writeDb(dbSave);
   } else {
     // Write to DB with 'processing' state first
     historyEntry.status = "processing";
@@ -2975,7 +2647,7 @@ async function executeWorkflow(subject: string, body: string, dateReceived: stri
     
     const dbSave = readDb();
     dbSave.history.unshift(historyEntry);
-    writeDb(dbSave);
+    await writeDb(dbSave);
 
     // Run calendar registration with automatic up to 3 retries over 2 minutes in background
     registerCalendarWithRetryBackground(historyEntry.id);

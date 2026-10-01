@@ -482,7 +482,10 @@ export default function RAGWorkspace({ onRefreshHistory }: RAGWorkspaceProps) {
                 <option value={10}>10 페이지 (권장)</option>
                 <option value={20}>20 페이지 (상세)</option>
                 <option value={35}>35 페이지 (광범위)</option>
-                <option value={50}>50 페이지 (최대)</option>
+                <option value={50}>50 페이지</option>
+                <option value={100}>100 페이지 (대규모)</option>
+                <option value={200}>200 페이지 (심층)</option>
+                <option value={300}>300 페이지 (최대)</option>
               </select>
             </div>
 
@@ -499,6 +502,8 @@ export default function RAGWorkspace({ onRefreshHistory }: RAGWorkspaceProps) {
                 <option value={2}>2단계 (Default - 하위 첫째 링크까지)</option>
                 <option value={3}>3단계 (하위 연결의 하위까지)</option>
                 <option value={4}>4단계 (광역 재귀 탐색)</option>
+                <option value={5}>5단계 (심층 재귀 탐색)</option>
+                <option value={6}>6단계 (최대 깊이)</option>
               </select>
             </div>
 
@@ -646,10 +651,15 @@ export default function RAGWorkspace({ onRefreshHistory }: RAGWorkspaceProps) {
                     {(() => {
                       const crawledDocsForSource = knowledgeBase.filter((doc: any) => {
                         if (!doc.id || !doc.id.startsWith("kb_crawl_")) return false;
+                        const cleanSrcUrl = item.url.toLowerCase().trim().replace(/\/+$/, "");
+
+                        if (doc.crawlRoot) {
+                          const cleanRoot = doc.crawlRoot.toLowerCase().trim().replace(/\/+$/, "");
+                          return cleanRoot === cleanSrcUrl;
+                        }
                         
                         if (doc.sourceUrl) {
-                          const cleanDocUrl = doc.sourceUrl.toLowerCase().trim().replace(/\/+$/, "");
-                          const cleanSrcUrl = item.url.toLowerCase().trim().replace(/\/+$/, "");
+                          const cleanDocUrl = String(doc.sourceUrl).split("#")[0].toLowerCase().trim().replace(/\/+$/, "");
                           if (cleanDocUrl.startsWith(cleanSrcUrl) || cleanDocUrl === cleanSrcUrl || cleanSrcUrl.startsWith(cleanDocUrl)) {
                             return true;
                           }
@@ -713,7 +723,7 @@ export default function RAGWorkspace({ onRefreshHistory }: RAGWorkspaceProps) {
                                   )}
 
                                   <p className="text-[10px] text-slate-500 line-clamp-3 mt-1.5 leading-relaxed whitespace-pre-wrap">
-                                    {doc.content.replace(/^\[출처 URL:[^\]]+\]\s+\[크롤링 수준:[^\]]+\]\s+/, "").trim()}
+                                    {doc.content.replace(/^\[출처 URL:[^\]]+\]\s+\[크롤링 수준:[^\]]+\]\s+(?:\[페이지:[^\]]+\]\s+)?/, "").trim()}
                                   </p>
                                 </div>
 
