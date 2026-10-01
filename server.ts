@@ -240,6 +240,10 @@ async function syncFromFirestore(): Promise<boolean> {
       }
 
       const mergedKnowledgeBase = Array.from(kbMap.values());
+      // 클라우드에서 읽어온 문서는 이미 동기화된 상태 → 서명 등록 (부팅 직후 전체 재기록 방지)
+      for (const d of cloudKbDocs) {
+        if (d && d.id) kbSyncSig.set(d.id, kbSigOf(d));
+      }
 
       const historyMap = new Map<string, any>();
       let cloudHistory = cloudHistoryDocs.length > 0 ? cloudHistoryDocs : (cloudData.history || []);
@@ -274,6 +278,12 @@ async function syncFromFirestore(): Promise<boolean> {
             }
           }
         });
+      }
+
+      if (Array.isArray(cloudHistory)) {
+        for (const h of cloudHistory) {
+          if (h && h.id) histSyncSig.set(h.id, histSigOf(h));
+        }
       }
 
       const mergedHistory = Array.from(historyMap.values())
@@ -470,6 +480,59 @@ function upsertSourceConfig(db: any, sourceHref: string, patch: Record<string, a
   }
 }
 
+// 이력 upsert: 같은 id 가 있으면 교체 (비동기 처리 placeholder → 최종 결과 덮어쓰기)
+function upsertHistory(db: any, entry: any) {
+  if (!db.history) db.history = [];
+  const idx = db.history.findIndex((h: any) => h && h.id === entry.id);
+  if (idx !== -1) db.history.splice(idx, 1);
+  db.history.unshift(entry);
+}
+
+// 비동기 처리용 placeholder 이력 생성 (즉시 응답 → 백그라운드 분석)
+function createProcessingPlaceholder(subject: string, body: string, dateReceived: string) {
+  const db = readDb();
+  const nowIso = new Date().toISOString();
+  const emailBody = body || "(No Body)";
+  const entry: any = {
+    id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+    timestamp: nowIso,
+    subject: subject || "(No Subject)",
+    body: emailBody.substring(0, 500) + (emailBody.length > 500 ? "..." : ""),
+    dateReceived: dateReceived || nowIso,
+    hasEvent: false,
+    isReply: false,
+    aiSummary: null,
+    calendarEventId: "",
+    calendarEventLink: "",
+    status: "processing",
+    errorMessage: "AI 분석 진행 중... (백그라운드 처리)",
+  };
+  upsertHistory(db, entry);
+  writeDb(db);
+  return entry;
+}
+
+function runWorkflowInBackground(subject: string, body: string, dateReceived: string, attachmentNames: string[], logId: string) {
+  setImmediate(async () => {
+    try {
+      await executeWorkflow(subject, body, dateReceived, attachmentNames, logId);
+    } catch (e: any) {
+      console.error(`[Background Workflow] Unhandled error for ${logId}:`, e?.message || e);
+      try {
+        const db = readDb();
+        const idx = (db.history || []).findIndex((h: any) => h && h.id === logId);
+        if (idx !== -1) {
+          db.history[idx].status = "failed";
+          db.history[idx].errorMessage = `처리 중 예외: ${e?.message || e}`;
+          await writeDb(db);
+        }
+      } catch {
+        // ignore
+      }
+    }
+  });
+}
+
 // Read database (Return pre-loaded memory cache synchronously for high performance)
 function readDb() {
   if (!cachedDb) {
@@ -522,22 +585,16 @@ async function writeDb(data: any) {
       await setDoc(docRef, mainPayload, { merge: true });
       console.log("[Firebase] Successfully persisted main state to Firestore.");
 
-      // 증분 동기화: 변경된 문서만 Firestore 에 기록. 실패한 문서는 서명을 남기지 않아 다음 writeDb 에서 재시도된다.
+      // 증분 동기화 (8개 병렬): 변경된 문서만 Firestore 에 기록. 실패한 문서는 서명을 남기지 않아 다음 writeDb 에서 재시도된다.
       let failed = 0;
       let written = 0;
+      const pending: { ref: any; data: any; done: () => void }[] = [];
       if (Array.isArray(knowledgeBase)) {
         for (const kbDoc of knowledgeBase) {
           if (!kbDoc || !kbDoc.id) continue;
           const sig = kbSigOf(kbDoc);
           if (kbSyncSig.get(kbDoc.id) === sig) continue;
-          try {
-            await setDoc(doc(firestoreDb, "app_state", "main", "knowledge_base", kbDoc.id), kbDoc);
-            kbSyncSig.set(kbDoc.id, sig);
-            written++;
-          } catch (e: any) {
-            failed++;
-            lastFirestoreError = e?.message || String(e);
-          }
+          pending.push({ ref: doc(firestoreDb, "app_state", "main", "knowledge_base", kbDoc.id), data: kbDoc, done: () => kbSyncSig.set(kbDoc.id, sig) });
         }
       }
       if (Array.isArray(history)) {
@@ -545,14 +602,16 @@ async function writeDb(data: any) {
           if (!histDoc || !histDoc.id) continue;
           const sig = histSigOf(histDoc);
           if (histSyncSig.get(histDoc.id) === sig) continue;
-          try {
-            await setDoc(doc(firestoreDb, "app_state", "main", "history", histDoc.id), histDoc);
-            histSyncSig.set(histDoc.id, sig);
-            written++;
-          } catch (e: any) {
-            failed++;
-            lastFirestoreError = e?.message || String(e);
-          }
+          pending.push({ ref: doc(firestoreDb, "app_state", "main", "history", histDoc.id), data: histDoc, done: () => histSyncSig.set(histDoc.id, sig) });
+        }
+      }
+      const SYNC_CONCURRENCY = 8;
+      for (let i = 0; i < pending.length; i += SYNC_CONCURRENCY) {
+        const batch = pending.slice(i, i + SYNC_CONCURRENCY);
+        const results = await Promise.allSettled(batch.map(async (p) => { await setDoc(p.ref, p.data); p.done(); }));
+        for (const r of results) {
+          if (r.status === "fulfilled") written++;
+          else { failed++; lastFirestoreError = (r.reason && r.reason.message) || String(r.reason); }
         }
       }
       if (failed === 0) {
@@ -1197,18 +1256,25 @@ ${forceRagInstruction}
 `;
 
   let lastError: any = null;
+  const GEMINI_CALL_TIMEOUT_MS = Math.max(10000, parseInt(process.env.GEMINI_CALL_TIMEOUT_MS || "60000", 10) || 60000);
+  const GEMINI_TOTAL_DEADLINE_MS = Math.max(20000, parseInt(process.env.GEMINI_TOTAL_DEADLINE_MS || "170000", 10) || 170000);
+  const aiStartedAt = Date.now();
+  const aiDeadlinePassed = () => Date.now() - aiStartedAt > GEMINI_TOTAL_DEADLINE_MS;
   // GEMINI_MODELS="model-a,model-b" 로 재정의 가능. 존재하지 않는 모델은 404 로 즉시 다음 모델로 넘어감.
   const modelsToTry = (process.env.GEMINI_MODELS || "gemini-3.6-flash,gemini-3.7-flash,gemini-flash-latest")
     .split(",").map(m => m.trim()).filter(Boolean);
 
   if (ai) {
     for (const modelName of modelsToTry) {
+      if (aiDeadlinePassed()) { console.warn("[Gemini] Total deadline reached — skipping remaining models."); break; }
       for (let attempt = 1; attempt <= retries; attempt++) {
+        if (aiDeadlinePassed()) break;
         try {
           const response = await ai.models.generateContent({
             model: modelName,
             contents: `Subject: ${subject}\n\nBody:\n${processedBody}`,
             config: {
+              httpOptions: { timeout: GEMINI_CALL_TIMEOUT_MS },
               systemInstruction,
               responseMimeType: "application/json",
               responseSchema: {
@@ -2559,7 +2625,7 @@ app.post("/api/history/retry", async (req, res) => {
 });
 
 // Core Workflow Executor (Shared between Webhook & Manual Test)
-async function executeWorkflow(subject: string, body: string, dateReceived: string, attachmentNames: string[] = []) {
+async function executeWorkflow(subject: string, body: string, dateReceived: string, attachmentNames: string[] = [], presetLogId?: string) {
   const emailSubject = subject || "(No Subject)";
   const emailBody = body || "(No Body)";
   const receivedDate = dateReceived || new Date().toISOString();
@@ -2567,7 +2633,7 @@ async function executeWorkflow(subject: string, body: string, dateReceived: stri
   const isReply = checkIfReply(emailSubject, emailBody);
 
   const historyEntry: any = {
-    id: `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+    id: presetLogId || `log_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     timestamp: new Date().toISOString(),
     subject: emailSubject,
     body: emailBody.substring(0, 500) + (emailBody.length > 500 ? "..." : ""),
@@ -2601,7 +2667,7 @@ async function executeWorkflow(subject: string, body: string, dateReceived: stri
         historyEntry.status = "failed";
         historyEntry.errorMessage = `Gemini AI 요약 실패로 캘린더 등록을 보류했습니다. (${aiResult.ai_error || "unknown"}) '재시도'로 다시 처리하세요.`;
         const dbFallback = readDb();
-        dbFallback.history.unshift(historyEntry);
+        upsertHistory(dbFallback, historyEntry);
         await writeDb(dbFallback);
         return historyEntry;
       }
@@ -2621,7 +2687,7 @@ async function executeWorkflow(subject: string, body: string, dateReceived: stri
     
     // Save failed entry
     const db = readDb();
-    db.history.unshift(historyEntry);
+    upsertHistory(db, historyEntry);
     await writeDb(db);
     return historyEntry;
   }
@@ -2636,7 +2702,7 @@ async function executeWorkflow(subject: string, body: string, dateReceived: stri
     
     // Write back to DB logs
     const dbSave = readDb();
-    dbSave.history.unshift(historyEntry);
+    upsertHistory(dbSave, historyEntry);
     await writeDb(dbSave);
   } else {
     // Write to DB with 'processing' state first
@@ -2646,7 +2712,7 @@ async function executeWorkflow(subject: string, body: string, dateReceived: stri
       : "수신 시점 기준 메일 요약을 구글 캘린더에 등록 중...";
     
     const dbSave = readDb();
-    dbSave.history.unshift(historyEntry);
+    upsertHistory(dbSave, historyEntry);
     await writeDb(dbSave);
 
     // Run calendar registration with automatic up to 3 retries over 2 minutes in background
@@ -2735,8 +2801,15 @@ app.post("/api/test-trigger", async (req, res) => {
   try {
     const hasAttachment = req.body.has_attachment === true || req.body.has_attachment === "true" || (req.body.attachment_count && parseInt(req.body.attachment_count, 10) > 0) || !!req.body.attachment || !!req.body.attachments;
     const attachmentNames = hasAttachment ? ["첨부파일 있음 (테스트)"] : [];
-    const result = await executeWorkflow(subject, body, date_received, attachmentNames);
-    res.json({ success: true, log: result });
+    const wantSync = req.body.sync === true || req.body.sync === "true";
+    if (wantSync) {
+      const result = await executeWorkflow(subject, body, date_received, attachmentNames);
+      return res.json({ success: true, log: result });
+    }
+    // 기본: 즉시 응답 + 백그라운드 처리 (프록시/게이트웨이 타임아웃 회피). 프론트는 /api/history 를 폴링한다.
+    const placeholder = createProcessingPlaceholder(subject, body, date_received);
+    res.json({ success: true, async: true, log: placeholder });
+    runWorkflowInBackground(subject, body, date_received, attachmentNames, placeholder.id);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -2812,14 +2885,16 @@ const handleIncomingWebhook = async (req: any, res: any) => {
   }
 
   try {
-    const result = await executeWorkflow(subject, body, date_received, attachmentNames);
+    // Zapier 는 응답을 오래 기다리지 않으므로 즉시 접수 응답 후 백그라운드 처리
+    const placeholder = createProcessingPlaceholder(subject, body, date_received);
     res.json({
       success: true,
-      message: "Webhook processed successfully",
-      classification: result.hasEvent ? "scheduled_event" : "email_summary",
-      logId: result.id,
-      schedulingStatus: result.status,
+      message: "Webhook accepted; processing in background",
+      classification: "processing",
+      logId: placeholder.id,
+      schedulingStatus: "processing",
     });
+    runWorkflowInBackground(subject, body, date_received, attachmentNames, placeholder.id);
   } catch (error: any) {
     console.error("Webhook processing error:", error);
     res.status(500).json({ error: error.message });

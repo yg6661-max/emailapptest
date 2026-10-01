@@ -254,7 +254,28 @@ export default function App() {
         })
       });
       if (res.ok) {
-        const resData = await res.json();
+        let resData = await res.json();
+        // 서버가 비동기로 접수한 경우: /api/history 를 폴링해 최종 결과를 가져온다 (최대 3분)
+        if (resData && resData.async && resData.log && resData.log.id) {
+          const logId = resData.log.id;
+          const deadline = Date.now() + 180000;
+          let finalEntry: any = null;
+          while (Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 2500));
+            try {
+              const hr = await fetch("/api/history");
+              if (!hr.ok) continue;
+              const hd = await hr.json();
+              const entry = (hd.history || []).find((h: any) => h && h.id === logId);
+              if (entry && (entry.aiSummary || entry.status === "failed")) { finalEntry = entry; break; }
+            } catch {
+              // keep polling
+            }
+          }
+          resData = finalEntry
+            ? { success: true, log: finalEntry }
+            : { success: false, log: { status: "failed", errorMessage: "분석이 3분 내에 완료되지 않았습니다. 잠시 후 처리 이력에서 결과를 확인하세요." } };
+        }
         if (resData.log && resData.log.aiSummary && resData.log.aiSummary.ragAnswer) {
           setSimAnswer(resData.log.aiSummary.ragAnswer);
           fetchHistory(); // Refresh history logs
@@ -265,7 +286,7 @@ export default function App() {
           });
         }
       } else {
-        alert("이메일 분석 RAG 테스트에 실패했습니다.");
+        alert(`이메일 분석 RAG 테스트에 실패했습니다. (HTTP ${res.status})`);
       }
     } catch (err: any) {
       alert("네트워크 오류: " + err.message);
