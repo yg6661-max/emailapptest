@@ -34,9 +34,11 @@ console.error = function (...args: any[]) {
     msg.includes("GrpcConnection RPC 'Listen' stream") ||
     msg.includes("CANCELLED: Disconnecting idle stream") ||
     msg.includes("Timed out waiting for new targets") ||
+    msg.includes("Quota limit exceeded") ||
+    msg.includes("Free daily read units") ||
     msg.includes("stream 0x")
   ) {
-    // Gracefully ignore benign background connection pooling recycle events from Firestore SDK
+    // Gracefully ignore benign background connection pooling recycle or free-tier quota events from Firestore SDK
     return;
   }
   originalConsoleError.apply(console, args);
@@ -50,9 +52,11 @@ console.warn = function (...args: any[]) {
     msg.includes("GrpcConnection RPC 'Listen' stream") ||
     msg.includes("CANCELLED: Disconnecting idle stream") ||
     msg.includes("Timed out waiting for new targets") ||
+    msg.includes("Quota limit exceeded") ||
+    msg.includes("Free daily read units") ||
     msg.includes("stream 0x")
   ) {
-    // Gracefully ignore benign background connection pooling recycle warnings from Firestore SDK
+    // Gracefully ignore benign background connection pooling recycle or free-tier quota warnings from Firestore SDK
     return;
   }
   originalConsoleWarn.apply(console, args);
@@ -158,12 +162,41 @@ function initLocalDbBackup() {
   }
 }
 
+// Firestore free-tier daily quota circuit breaker (pauses cloud calls for 15 min when daily quota is exhausted)
+let firestoreQuotaPauseUntil = 0;
+const FIRESTORE_QUOTA_COOLDOWN_MS = 15 * 60 * 1000;
+
+function isFirestorePaused(): boolean {
+  return Date.now() < firestoreQuotaPauseUntil;
+}
+
+function handleFirestoreQuotaError(err: any, context: string): boolean {
+  const msg = `${err?.code || ""} ${err?.message || err || ""}`;
+  if (
+    msg.includes("Quota limit exceeded") ||
+    msg.includes("Quota exceeded") ||
+    msg.includes("resource-exhausted") ||
+    msg.includes("Free daily read units")
+  ) {
+    const wasPaused = isFirestorePaused();
+    firestoreQuotaPauseUntil = Date.now() + FIRESTORE_QUOTA_COOLDOWN_MS;
+    if (!wasPaused) {
+      console.log(`[Firebase] Daily free-tier quota reached during ${context}. Operating seamlessly in local database mode (data/db.json) for 15 minutes.`);
+    }
+    if (cachedDb && Array.isArray(cachedDb.knowledgeBase) && cachedDb.knowledgeBase.length > 0) {
+      lastFirestoreError = null;
+    }
+    return true;
+  }
+  return false;
+}
+
 // Helper function to sync warm cache with Firestore cloud state
 async function syncFromFirestore(): Promise<boolean> {
-  if (!firestoreDb) return false;
+  if (!firestoreDb || isFirestorePaused()) return false;
   try {
     const docRef = doc(firestoreDb, "app_state", "main");
-    const docSnap = await getDoc(docRef);
+    const docSnap = await withTimeout(getDoc(docRef), FIRESTORE_OP_TIMEOUT_MS, "getDoc(app_state/main)");
 
     if (docSnap.exists()) {
       const cloudData = docSnap.data();
@@ -173,7 +206,7 @@ async function syncFromFirestore(): Promise<boolean> {
       const kbCollectionRef = collection(firestoreDb, "app_state", "main", "knowledge_base");
       let cloudKbDocs: any[] = [];
       try {
-        const kbQuerySnap = await getDocs(kbCollectionRef);
+        const kbQuerySnap = await withTimeout(getDocs(kbCollectionRef), FIRESTORE_OP_TIMEOUT_MS, "getDocs(knowledge_base)");
         kbQuerySnap.forEach((d) => {
           if (d.exists()) {
             const data = d.data();
@@ -181,15 +214,25 @@ async function syncFromFirestore(): Promise<boolean> {
             if (data && data.id) kbSyncSig.set(data.id, kbSigOf(data));
           }
         });
-      } catch (kbErr) {
-        console.warn("[Firebase] Error fetching knowledge_base subcollection items:", kbErr);
+      } catch (kbErr: any) {
+        if (handleFirestoreQuotaError(kbErr, "knowledge_base subcollection read")) {
+          // Preserve credentials/settings from main doc if available, keep local knowledgeBase/history intact
+          if (cloudData.credentials && cachedDb) {
+            cachedDb.credentials = { ...(cachedDb.credentials || {}), ...(cloudData.credentials || {}) };
+          }
+          if (cloudData.sourceUrls && cachedDb && (!cachedDb.sourceUrls || cachedDb.sourceUrls.length === 0)) {
+            cachedDb.sourceUrls = cloudData.sourceUrls;
+          }
+          return false;
+        }
+        console.log("[Firebase] Skipping knowledge_base subcollection fetch (using local cache):", kbErr?.message || String(kbErr));
       }
 
       // Fetch subcollection history if exists
       const historyCollectionRef = collection(firestoreDb, "app_state", "main", "history");
       let cloudHistoryDocs: any[] = [];
       try {
-        const historyQuerySnap = await getDocs(historyCollectionRef);
+        const historyQuerySnap = await withTimeout(getDocs(historyCollectionRef), FIRESTORE_OP_TIMEOUT_MS, "getDocs(history)");
         historyQuerySnap.forEach((d) => {
           if (d.exists()) {
             const data = d.data();
@@ -197,8 +240,11 @@ async function syncFromFirestore(): Promise<boolean> {
             if (data && data.id) histSyncSig.set(data.id, histSigOf(data));
           }
         });
-      } catch (histErr) {
-        console.warn("[Firebase] Error fetching history subcollection items:", histErr);
+      } catch (histErr: any) {
+        if (handleFirestoreQuotaError(histErr, "history subcollection read")) {
+          return false;
+        }
+        console.log("[Firebase] Skipping history subcollection fetch (using local cache):", histErr?.message || String(histErr));
       }
 
       const kbMap = new Map<string, any>();
@@ -335,8 +381,11 @@ async function syncFromFirestore(): Promise<boolean> {
     lastFirestoreError = null; // Succeeded!
     return true;
   } catch (error: any) {
+    if (handleFirestoreQuotaError(error, "syncFromFirestore")) {
+      return false;
+    }
     const errMsg = error?.message || String(error);
-    console.warn("[Firebase] Operating in local database mode:", errMsg);
+    console.log("[Firebase] Operating in local database mode:", errMsg);
     // When local cachedDb is active and populated, treat local mode as healthy operational baseline
     if (cachedDb && Array.isArray(cachedDb.knowledgeBase) && cachedDb.knowledgeBase.length > 0) {
       lastFirestoreError = null;
@@ -352,6 +401,16 @@ async function initDbAndSyncFirestore() {
   // 1. Instantly parse local backup to prevent boot blocks
   const localData = initLocalDbBackup();
   cachedDb = localData;
+  if (Array.isArray(localData?.knowledgeBase)) {
+    for (const d of localData.knowledgeBase) {
+      if (d && d.id) kbSyncSig.set(d.id, kbSigOf(d));
+    }
+  }
+  if (Array.isArray(localData?.history)) {
+    for (const h of localData.history) {
+      if (h && h.id) histSyncSig.set(h.id, histSigOf(h));
+    }
+  }
 
   // 2. Initialize Firestore utilizing existing client profiles
   try {
@@ -388,24 +447,26 @@ async function initDbAndSyncFirestore() {
       // 3. Sync from warm persistent cloud
       const synced = await syncFromFirestore();
       bootSyncOk = synced;
-      if (!synced) {
-        // 일시적 연결 실패 대비: 최대 8회 지수 백오프 재시도 (2s, 4s, 8s, ... 최대 60s)
+      if (!synced && !isFirestorePaused()) {
+        // 일시적 연결 실패 대비: 최대 8회 지수 백오프 재시도 (쿼터 초과 시에는 즉시 중단)
         (async () => {
-          for (let attempt = 1; attempt <= 8 && !bootSyncOk; attempt++) {
+          for (let attempt = 1; attempt <= 8 && !bootSyncOk && !isFirestorePaused(); attempt++) {
             const waitMs = Math.min(60000, 2000 * Math.pow(2, attempt - 1));
             await new Promise((r) => setTimeout(r, waitMs));
+            if (isFirestorePaused()) break;
             try {
               if (await syncFromFirestore()) {
                 bootSyncOk = true;
                 console.log(`[Firebase] Delayed boot sync succeeded on retry #${attempt}.`);
-              } else {
-                console.warn(`[Firebase] Boot sync retry #${attempt} failed.`);
+              } else if (!isFirestorePaused()) {
+                console.log(`[Firebase] Boot sync retry #${attempt} skipped/failed (local DB active).`);
               }
             } catch (e: any) {
-              console.warn(`[Firebase] Boot sync retry #${attempt} error:`, e?.message || e);
+              if (handleFirestoreQuotaError(e, "boot sync retry")) break;
+              console.log(`[Firebase] Boot sync retry #${attempt} error:`, e?.message || e);
             }
           }
-          if (!bootSyncOk) console.error("[Firebase] Boot sync failed after retries — credentials writes stay protected until a manual sync succeeds.");
+          if (!bootSyncOk) console.log("[Firebase] Running in local database mode — credentials writes stay protected until cloud sync succeeds.");
         })();
       }
     } else {
@@ -425,6 +486,15 @@ let allowCredentialWipe = false;
 let bootSyncOk = false;
 
 // Firestore 증분 동기화용 시그니처 (id → 마지막으로 성공 저장한 문서의 서명)
+// Firestore 개별 쓰기 타임아웃 — SDK 쓰기는 기본 무기한 대기라 스트림 불안정 시 요청이 통째로 막힌다
+const FIRESTORE_OP_TIMEOUT_MS = Math.max(3000, parseInt(process.env.FIRESTORE_OP_TIMEOUT_MS || "15000", 10) || 15000);
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Firestore timeout after ${ms}ms (${label})`)), ms);
+    p.then((v) => { clearTimeout(timer); resolve(v); }, (e) => { clearTimeout(timer); reject(e); });
+  });
+}
+
 const kbSyncSig = new Map<string, string>();
 const histSyncSig = new Map<string, string>();
 const kbSigOf = (d: any) => `${d.updatedAt || ""}|${(d.content || "").length}|${d.title || ""}|${(d.tags || []).length}`;
@@ -448,12 +518,13 @@ async function replaceCrawledDocsForSource(sourceUrl: string, newDocs: any[], lo
   db.knowledgeBase = db.knowledgeBase.filter((d: any) => !docBelongsToSource(d, sourceUrl));
   db.knowledgeBase.unshift(...newDocs);
   await writeDb(db);
-  if (firestoreDb && toDelete.length > 0) {
+  if (firestoreDb && !isFirestorePaused() && toDelete.length > 0) {
     for (const d of toDelete) {
+      if (isFirestorePaused()) break;
       try {
-        await deleteDoc(doc(firestoreDb, "app_state", "main", "knowledge_base", d.id));
+        await withTimeout(deleteDoc(doc(firestoreDb, "app_state", "main", "knowledge_base", d.id)), FIRESTORE_OP_TIMEOUT_MS, `deleteDoc(${d.id})`);
       } catch (e) {
-        // ignore
+        if (handleFirestoreQuotaError(e, "replaceCrawledDocs delete")) break;
       }
       kbSyncSig.delete(d.id);
     }
@@ -561,8 +632,56 @@ async function writeDb(data: any) {
     console.error("[Local Backup] Failed to write local DB backup:", error);
   }
 
-  // Synchronize changes to Cloud Firestore and await to ensure complete write before container gets frozen/idle
-  if (firestoreDb) {
+  // Firestore 동기화는 백그라운드 큐에서 수행 — 요청 응답을 막지 않는다 (요청 중 CPU 가 있는 동안 진행되며, 폴링/후속 요청이 이어 받음)
+  scheduleFirestoreSync();
+}
+
+let firestoreSyncRunning = false;
+let firestoreSyncDirty = false;
+let firestoreSyncWaiters: Array<() => void> = [];
+
+function scheduleFirestoreSync() {
+  if (!firestoreDb || isFirestorePaused()) return;
+  firestoreSyncDirty = true;
+  if (firestoreSyncRunning) return;
+  firestoreSyncRunning = true;
+  setImmediate(async () => {
+    try {
+      while (firestoreSyncDirty && !isFirestorePaused()) {
+        firestoreSyncDirty = false;
+        const snapshot = cachedDb;
+        if (!snapshot) break;
+        try {
+          await syncToFirestore(snapshot);
+        } catch (e: any) {
+          if (!handleFirestoreQuotaError(e, "background sync")) {
+            console.log("[Firebase] Background sync skipped:", e?.message || e);
+            lastFirestoreError = e?.message || String(e);
+          }
+        }
+      }
+    } finally {
+      firestoreSyncRunning = false;
+      const waiters = firestoreSyncWaiters;
+      firestoreSyncWaiters = [];
+      waiters.forEach((w) => w());
+    }
+  });
+}
+
+/** 현재 진행 중/대기 중인 Firestore 동기화가 끝날 때까지 대기 (최대 timeoutMs). 요청이 살아 있을 때 영속성을 보장하고 싶은 곳에서만 사용 */
+async function flushFirestore(timeoutMs = 120000): Promise<boolean> {
+  if (!firestoreDb || isFirestorePaused()) return true;
+  if (!firestoreSyncRunning && !firestoreSyncDirty) return true;
+  if (!firestoreSyncRunning) scheduleFirestoreSync();
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    firestoreSyncWaiters.push(() => { clearTimeout(timer); resolve(!firestoreSyncDirty); });
+  });
+}
+
+async function syncToFirestore(data: any) {
+  if (firestoreDb && !isFirestorePaused()) {
     const docRef = doc(firestoreDb, "app_state", "main");
     try {
       // Save settings, credentials, and logs to the main document, omitting the large knowledgeBase and history arrays
@@ -578,11 +697,11 @@ async function writeDb(data: any) {
         if (outCreds?.clientSecret) keep.clientSecret = outCreds.clientSecret;
         if (Object.keys(keep).length > 0) mainPayload.credentials = keep; else delete mainPayload.credentials;
         if (!bootSyncOk) {
-          console.warn("[Firebase] Boot sync not confirmed — writing without credentials to protect stored tokens.");
+          console.log("[Firebase] Boot sync not confirmed — writing without credentials to protect stored tokens.");
         }
       }
       allowCredentialWipe = false;
-      await setDoc(docRef, mainPayload, { merge: true });
+      await withTimeout(setDoc(docRef, mainPayload, { merge: true }), FIRESTORE_OP_TIMEOUT_MS, "app_state/main");
       console.log("[Firebase] Successfully persisted main state to Firestore.");
 
       // 증분 동기화 (8개 병렬): 변경된 문서만 Firestore 에 기록. 실패한 문서는 서명을 남기지 않아 다음 writeDb 에서 재시도된다.
@@ -607,22 +726,30 @@ async function writeDb(data: any) {
       }
       const SYNC_CONCURRENCY = 8;
       for (let i = 0; i < pending.length; i += SYNC_CONCURRENCY) {
+        if (isFirestorePaused()) break;
         const batch = pending.slice(i, i + SYNC_CONCURRENCY);
-        const results = await Promise.allSettled(batch.map(async (p) => { await setDoc(p.ref, p.data); p.done(); }));
+        const results = await Promise.allSettled(batch.map(async (p) => { await withTimeout(setDoc(p.ref, p.data), FIRESTORE_OP_TIMEOUT_MS, p.ref?.path || "doc"); p.done(); }));
         for (const r of results) {
-          if (r.status === "fulfilled") written++;
-          else { failed++; lastFirestoreError = (r.reason && r.reason.message) || String(r.reason); }
+          if (r.status === "fulfilled") {
+            written++;
+          } else {
+            if (handleFirestoreQuotaError(r.reason, "subcollection write")) break;
+            failed++;
+            lastFirestoreError = (r.reason && r.reason.message) || String(r.reason);
+          }
         }
       }
-      if (failed === 0) {
+      if (failed === 0 || isFirestorePaused()) {
         lastFirestoreError = null;
         if (written > 0) console.log(`[Firebase] Incremental sync: ${written} document(s) written.`);
       } else {
-        console.warn(`[Firebase] Incremental sync: ${written} written, ${failed} FAILED — will retry on next write. Last error: ${lastFirestoreError}`);
+        console.log(`[Firebase] Incremental sync: ${written} written, ${failed} deferred — will retry on next write.`);
       }
     } catch (err: any) {
-      console.warn("[Firebase] Operating in local database write mode:", err?.message || err);
-      lastFirestoreError = err?.message || String(err);
+      if (!handleFirestoreQuotaError(err, "syncToFirestore")) {
+        console.log("[Firebase] Operating in local database write mode:", err?.message || err);
+        lastFirestoreError = err?.message || String(err);
+      }
     }
   }
 }
@@ -671,6 +798,7 @@ async function getValidAccessToken(): Promise<string | null> {
       try {
         const response = await fetch("https://oauth2.googleapis.com/token", {
           method: "POST",
+          signal: AbortSignal.timeout(10000),
           headers: {
             "Content-Type": "application/x-www-form-urlencoded",
           },
@@ -2111,29 +2239,34 @@ app.post("/api/history/delete", async (req, res) => {
   const db = readDb();
 
   if (clearAll) {
-    if (firestoreDb) {
+    if (firestoreDb && !isFirestorePaused()) {
       try {
         console.log("[Firebase] Bulk deleting all history subcollection items from Firestore...");
         const historyCollectionRef = collection(firestoreDb, "app_state", "main", "history");
-        const querySnap = await getDocs(historyCollectionRef);
+        const querySnap = await withTimeout(getDocs(historyCollectionRef), FIRESTORE_OP_TIMEOUT_MS, "getDocs(history)");
         for (const docSnap of querySnap.docs) {
+          if (isFirestorePaused()) break;
           const docRef = doc(firestoreDb, "app_state", "main", "history", docSnap.id);
-          await deleteDoc(docRef);
+          await withTimeout(deleteDoc(docRef), FIRESTORE_OP_TIMEOUT_MS, `deleteDoc(${docSnap.id})`);
         }
-      } catch (err) {
-        console.warn("[Firebase] Failed to delete history items from subcollection:", err);
+      } catch (err: any) {
+        if (!handleFirestoreQuotaError(err, "history bulk delete")) {
+          console.log("[Firebase] Skipped deleting history items from subcollection:", err?.message || String(err));
+        }
       }
     }
     db.history = [];
     histSyncSig.clear();
   } else if (id) {
-    if (firestoreDb) {
+    if (firestoreDb && !isFirestorePaused()) {
       try {
         const docRef = doc(firestoreDb, "app_state", "main", "history", id);
-        await deleteDoc(docRef);
+        await withTimeout(deleteDoc(docRef), FIRESTORE_OP_TIMEOUT_MS, `deleteDoc(${id})`);
         console.log(`[Firebase] Successfully deleted history item ${id} from Firestore.`);
-      } catch (err) {
-        console.warn(`[Firebase] Failed to delete history item ${id} from Firestore:`, err);
+      } catch (err: any) {
+        if (!handleFirestoreQuotaError(err, "history delete")) {
+          console.log(`[Firebase] Skipped deleting history item ${id} from Firestore:`, err?.message || String(err));
+        }
       }
     }
     histSyncSig.delete(id);
@@ -2146,7 +2279,7 @@ app.post("/api/history/delete", async (req, res) => {
 
 // Retrieve custom knowledge base documents (RAG)
 app.get("/api/knowledge-base", async (req, res) => {
-  if (lastFirestoreError && firestoreDb) {
+  if (lastFirestoreError && firestoreDb && !isFirestorePaused()) {
     // Attempt automatic background recovery sync if an error was recorded
     await syncFromFirestore();
   }
@@ -2160,6 +2293,7 @@ app.get("/api/knowledge-base", async (req, res) => {
 
 // Explicit retry sync endpoint for RAG Workspace
 app.post("/api/knowledge-base/retry-sync", async (req, res) => {
+  firestoreQuotaPauseUntil = 0;
   const success = await syncFromFirestore();
   if (success) bootSyncOk = true;
   const db = readDb();
@@ -2168,7 +2302,9 @@ app.post("/api/knowledge-base/retry-sync", async (req, res) => {
     knowledgeBase: db.knowledgeBase || [],
     sourceUrls: db.sourceUrls || [],
     firestoreError: lastFirestoreError,
-    message: success ? "Firestore 클라우드 동기화가 성공적으로 완료되었습니다." : "동기화 실패"
+    message: success
+      ? "Firestore 클라우드 동기화가 성공적으로 완료되었습니다."
+      : (isFirestorePaused() ? "Firestore 일일 무료 할당량이 초과되어 로컬 데이터베이스(data/db.json) 모드로 정상 동작 중입니다." : "동기화 실패")
   });
 });
 
@@ -2251,14 +2387,16 @@ app.post("/api/knowledge-base/sources/delete", async (req, res) => {
         deletedDocCount = initialLen - db.knowledgeBase.length;
 
         // Also bulk-delete from Firestore if configured
-        if (firestoreDb && itemsToDelete.length > 0) {
+        if (firestoreDb && !isFirestorePaused() && itemsToDelete.length > 0) {
           console.log(`[Firebase] Bulk deleting ${itemsToDelete.length} crawled docs from Firestore subcollection...`);
           for (const item of itemsToDelete) {
+            if (isFirestorePaused()) break;
             try {
               const docRef = doc(firestoreDb, "app_state", "main", "knowledge_base", item.id);
-              await deleteDoc(docRef);
-            } catch (fbErr) {
-              console.warn(`[Firebase] Error deleting doc ${item.id}:`, fbErr);
+              await withTimeout(deleteDoc(docRef), FIRESTORE_OP_TIMEOUT_MS, `deleteDoc(${item.id})`);
+            } catch (fbErr: any) {
+              if (handleFirestoreQuotaError(fbErr, "source docs bulk delete")) break;
+              console.log(`[Firebase] Skipped deleting doc ${item.id}:`, fbErr?.message || String(fbErr));
             }
             kbSyncSig.delete(item.id);
           }
@@ -2321,13 +2459,15 @@ app.post("/api/knowledge-base/delete", async (req, res) => {
   }
 
   // Also delete from Firestore subcollection if configured to keep it synced
-  if (firestoreDb) {
+  if (firestoreDb && !isFirestorePaused()) {
     try {
       const kbDocRef = doc(firestoreDb, "app_state", "main", "knowledge_base", id);
-      await deleteDoc(kbDocRef);
+      await withTimeout(deleteDoc(kbDocRef), FIRESTORE_OP_TIMEOUT_MS, `deleteDoc(${id})`);
       console.log(`[Firebase] Deleted kb doc ${id} from Firestore subcollection.`);
-    } catch (err) {
-      console.warn("[Firebase] Error deleting kb doc from Firestore:", err);
+    } catch (err: any) {
+      if (!handleFirestoreQuotaError(err, "kb doc delete")) {
+        console.log("[Firebase] Skipped deleting kb doc from Firestore:", err?.message || String(err));
+      }
     }
   }
 
@@ -2414,6 +2554,9 @@ app.post("/api/knowledge-base/crawl", async (req, res) => {
       lastResult: `pages ${result.pagesSaved}/${result.pagesAttempted}, chunks ${result.chunks.length}, errors ${result.errors.length}`,
     });
     await writeDb(finalDb);
+    sendLog({ type: "progress", message: "☁️ Firestore 동기화 중..." });
+    const flushed = await flushFirestore(120000);
+    if (!flushed) sendLog({ type: "warning", message: "⚠️ Firestore 동기화가 120초 내에 끝나지 않았습니다. 백그라운드에서 계속 재시도합니다." });
 
     if (lastFirestoreError) {
       sendLog({ type: "warning", message: `⚠️ Firestore 저장 일부 실패 (다음 저장 시 재시도): ${lastFirestoreError}` });
