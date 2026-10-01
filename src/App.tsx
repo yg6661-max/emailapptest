@@ -621,20 +621,55 @@ export default function App() {
   // Re-submit / Register a pending or failed log to Google Calendar
   const handleRetryLog = async (id: string) => {
     setRetryingIds(prev => ({ ...prev, [id]: true }));
+    const parseJsonSafe = async (r: Response) => {
+      const text = await r.text();
+      try { return JSON.parse(text); } catch { return { error: `서버 응답이 JSON 이 아닙니다 (HTTP ${r.status}): ${text.substring(0, 120)}` }; }
+    };
     try {
       const res = await fetch("/api/history/retry", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id })
       });
-      
-      const data = await res.json();
-      if (res.ok && data.success) {
-        // Success alert
+
+      const data = await parseJsonSafe(res);
+      if (!res.ok || !data.success) {
+        alert(`재전송 실패: ${data.error || "일시적인 오류가 발생했거나 연동이 중단되었습니다."}`);
+        return;
+      }
+
+      if (!data.async) {
+        alert("성공적으로 구글 캘린더에 일정을 등록했습니다!");
+        fetchStatus();
+        return;
+      }
+
+      // 비동기 처리: 이력을 폴링해 최종 상태를 확인 (최대 3분)
+      const deadline = Date.now() + 180000;
+      let finalEntry: any = null;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 3000));
+        try {
+          const hr = await fetch("/api/history");
+          if (!hr.ok) continue;
+          const hd = await parseJsonSafe(hr);
+          const entry = (hd.history || []).find((h: any) => h && h.id === id);
+          if (entry) {
+            setHistory(hd.history || []);
+            if (entry.status !== "processing" && entry.status !== "retrying") { finalEntry = entry; break; }
+          }
+        } catch {
+          // keep polling
+        }
+      }
+
+      if (!finalEntry) {
+        alert("재처리가 아직 진행 중입니다. 잠시 후 처리 이력에서 결과를 확인하세요.");
+      } else if (finalEntry.calendarEventId || finalEntry.status === "success" || finalEntry.status === "completed") {
         alert("성공적으로 구글 캘린더에 일정을 등록했습니다!");
         fetchStatus();
       } else {
-        alert(`재전송 실패: ${data.error || "일시적인 오류가 발생했거나 연동이 중단되었습니다."}`);
+        alert(`재전송 실패: ${finalEntry.errorMessage || finalEntry.status}`);
       }
     } catch (err: any) {
       console.error("Retry failed:", err);

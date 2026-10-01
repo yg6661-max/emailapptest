@@ -2560,68 +2560,67 @@ app.post("/api/history/retry", async (req, res) => {
     return res.status(401).json({ error: "현재 Google 캘린더 연동이 되어있지 않거나 만료되었습니다. 상단에서 'Sign in with Google'을 완료하신 후 재전송해 주세요." });
   }
 
-  // Update status to processing
+  const needsAi = !historyEntry.aiSummary || historyEntry.aiSummary.ai_fallback;
+
+  // 상태 갱신 후 즉시 응답 — Gemini 재분석/캘린더 등록은 백그라운드에서 수행 (프록시 타임아웃 회피)
   historyEntry.status = "processing";
-  historyEntry.errorMessage = "구글 일정 자동 등록 시도 중...";
+  historyEntry.errorMessage = needsAi ? "AI 재분석 진행 중... (백그라운드)" : "구글 일정 자동 등록 시도 중...";
   await writeDb(db);
+  res.json({ success: true, async: true, log: historyEntry });
 
-  try {
-    let aiResult = historyEntry.aiSummary;
+  setImmediate(async () => {
+    console.log(`[Retry] Background re-processing started for Log ${id} (needsAi=${needsAi})`);
+    try {
+      let aiResult = historyEntry.aiSummary;
+      const preservedAttachments = historyEntry.attachmentNames || historyEntry.aiSummary?.attachmentNames || [];
 
-    // 1. If AI summary is not yet captured or previously fell back due to AI error, re-extract with Gemini
-    const preservedAttachments = historyEntry.attachmentNames || historyEntry.aiSummary?.attachmentNames || [];
-    if (!aiResult || aiResult.ai_fallback) {
-      console.log(`[Retry] AI Summary missing or fallback for Log ${id}. Re-running Gemini parsing...`);
-      aiResult = await processEmailWithAI(historyEntry.subject, historyEntry.body, historyEntry.dateReceived);
-      if (aiResult && preservedAttachments.length > 0) {
-        aiResult.attachmentNames = preservedAttachments;
-      }
-      historyEntry.isReply = checkIfReply(historyEntry.subject, historyEntry.body);
-      historyEntry.hasEvent = aiResult.has_event;
-      historyEntry.aiSummary = aiResult;
-
-      if (aiResult && aiResult.ai_fallback) {
-        const allowCalendar = String(process.env.CALENDAR_ON_AI_FALLBACK || "false").toLowerCase() === "true";
-        if (!allowCalendar) {
-          historyEntry.status = "failed";
-          historyEntry.errorMessage = `Gemini AI 요약 실패로 캘린더 등록을 보류했습니다. (${aiResult.ai_error || "unknown"}) '재시도'로 다시 처리하세요.`;
-          const dbFallback = readDb();
-          const idx = dbFallback.history.findIndex((item: any) => item.id === id);
-          if (idx !== -1) dbFallback.history[idx] = historyEntry;
-          await writeDb(dbFallback);
-          return res.status(502).json({ error: historyEntry.errorMessage, log: historyEntry });
+      if (needsAi) {
+        aiResult = await processEmailWithAI(historyEntry.subject, historyEntry.body, historyEntry.dateReceived);
+        if (aiResult && preservedAttachments.length > 0) {
+          aiResult.attachmentNames = preservedAttachments;
         }
+        historyEntry.isReply = checkIfReply(historyEntry.subject, historyEntry.body);
+        historyEntry.hasEvent = aiResult.has_event;
+        historyEntry.aiSummary = aiResult;
+
+        if (aiResult && aiResult.ai_fallback) {
+          const allowCalendar = String(process.env.CALENDAR_ON_AI_FALLBACK || "false").toLowerCase() === "true";
+          if (!allowCalendar) {
+            historyEntry.status = "failed";
+            historyEntry.errorMessage = `Gemini AI 요약 실패로 캘린더 등록을 보류했습니다. (${aiResult.ai_error || "unknown"}) '재시도'로 다시 처리하세요.`;
+            const dbFallback = readDb();
+            const idx = dbFallback.history.findIndex((item: any) => item.id === id);
+            if (idx !== -1) dbFallback.history[idx] = historyEntry;
+            await writeDb(dbFallback);
+            return;
+          }
+        }
+      } else if (historyEntry.isReply === undefined) {
+        historyEntry.isReply = checkIfReply(historyEntry.subject, historyEntry.body);
       }
-    } else if (historyEntry.isReply === undefined) {
-      historyEntry.isReply = checkIfReply(historyEntry.subject, historyEntry.body);
+
+      historyEntry.errorMessage = "구글 일정 자동 등록 시도 중...";
+      const dbSave = readDb();
+      const index = dbSave.history.findIndex((item: any) => item.id === id);
+      if (index !== -1) {
+        dbSave.history[index] = historyEntry;
+      }
+      await writeDb(dbSave);
+
+      // 캘린더 등록 워커 (최대 3회 자동 재시도)
+      registerCalendarWithRetryBackground(id);
+    } catch (err: any) {
+      console.error("[Retry Error in AI Step]", err);
+      historyEntry.errorMessage = err?.message || "Unknown error parsing AI content.";
+      historyEntry.status = "failed";
+      const dbSave = readDb();
+      const index = dbSave.history.findIndex((item: any) => item.id === id);
+      if (index !== -1) {
+        dbSave.history[index] = historyEntry;
+      }
+      await writeDb(dbSave);
     }
-
-    // Save state back to DB before beginning background worker
-    const dbSave = readDb();
-    const index = dbSave.history.findIndex((item: any) => item.id === id);
-    if (index !== -1) {
-      dbSave.history[index] = historyEntry;
-    }
-    await writeDb(dbSave);
-
-    // 2. Start background worker with 3 automatic retries
-    registerCalendarWithRetryBackground(id);
-
-    return res.json({ success: true, log: historyEntry });
-  } catch (err: any) {
-    console.error("[Retry Error in AI Step]", err);
-    historyEntry.errorMessage = err.message || "Unknown error parsing AI content.";
-    historyEntry.status = "failed";
-
-    const dbSave = readDb();
-    const index = dbSave.history.findIndex((item: any) => item.id === id);
-    if (index !== -1) {
-      dbSave.history[index] = historyEntry;
-    }
-    await writeDb(dbSave);
-
-    return res.status(500).json({ error: err.message });
-  }
+  });
 });
 
 // Core Workflow Executor (Shared between Webhook & Manual Test)
